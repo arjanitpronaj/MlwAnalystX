@@ -198,12 +198,15 @@ class AnalysisService:
 
         supplemental: dict[str, Any] = {}
         report_sha256 = str(summary.get("sha256") or sub.sha256 or "").strip().lower()
+        job_summary = dict(summary)
         if report_sha256:
             try:
                 summary_by_sha = client.get_report_summary_by_sha256(report_sha256)
-                if summary_by_sha:
-                    summary = summary_by_sha
                 supplemental["summary_by_sha"] = summary_by_sha
+                if isinstance(summary_by_sha, dict):
+                    merged = dict(summary_by_sha)
+                    merged.update(job_summary)
+                    summary = merged
             except HybridAnalysisError as exc:
                 log(f"⚠ SHA summary unavailable, using job summary: {exc}")
                 supplemental["summary_by_sha"] = summary
@@ -228,6 +231,11 @@ class AnalysisService:
 
             supplemental["processes"] = safe_json("processes", lambda: client.get_report_processes(report_sha256), f"/report/{job_id}/processes")
             supplemental["dropped_files"] = safe_json("dropped-files", lambda: client.get_report_dropped_files(report_sha256), f"/report/{job_id}/dropped-files")
+            supplemental["dropped_files_v2"] = safe_json(
+                "dropped-files-v2",
+                lambda: client.get_json_optional(f"/report/{report_sha256}/dropped-files-v2"),
+                f"/report/{job_id}/dropped-files-v2",
+            )
             supplemental["screenshots"] = safe_json("screenshots", lambda: client.get_report_screenshots(report_sha256), f"/report/{job_id}/screenshots")
             supplemental["memory_dumps"] = safe_json("memory-dumps", lambda: client.get_report_memory_dumps(report_sha256), f"/report/{job_id}/memory-dumps")
             supplemental["strings"] = safe_json("strings", lambda: client.get_report_strings(report_sha256), f"/report/{job_id}/strings")

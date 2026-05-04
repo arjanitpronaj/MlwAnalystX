@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 from io import BytesIO
 from pathlib import Path
@@ -41,7 +42,7 @@ def build_analysis_pdf(
     dest_path: Path,
 ) -> Path:
     sup = outcome.supplemental or {}
-    summary = (sup.get("summary_by_sha") or outcome.summary or {}) if isinstance((sup.get("summary_by_sha") or outcome.summary or {}), dict) else {}
+    summary = outcome.summary if isinstance(outcome.summary, dict) else {}
     processes = sup.get("processes") if isinstance(sup.get("processes"), list) else []
     dropped = sup.get("dropped_files") if isinstance(sup.get("dropped_files"), list) else []
     strings = sup.get("strings") if isinstance(sup.get("strings"), list) else []
@@ -95,9 +96,14 @@ def build_analysis_pdf(
     story.append(
         Paragraph(
             _esc(
-                f"Hybrid Analysis reports verdict {verdict} with threat score {score}/100 and family {family}. "
-                f"Top tags: {', '.join(str(x) for x in tags[:8]) if tags else 'No activity observed — API returned empty classification_tags'}. "
-                f"Processes: {len(processes)}; network streams: {len(summary.get('network_streams') or []) if isinstance(summary.get('network_streams'), list) else 0}."
+                f"Verdict {verdict}, score {score}/100, family {family}. "
+                f"Tags ({len(tags)}): {', '.join(str(x) for x in tags[:24]) or 'none'}. "
+                f"Processes API: {len(processes)}; digest process rows: {len(digest.process_rows)}; "
+                f"file rows: {len(digest.file_activity_rows)}; registry rows: {len(digest.registry_rows)}; "
+                f"signatures: {len(digest.signature_rows)}; MITRE rows: {len(digest.mitre_rows)}; "
+                f"DNS (summary): {len(summary.get('dns_requests') or []) if isinstance(summary.get('dns_requests'), list) else 0}, "
+                f"DNS (full-report extract): {len(digest.network_dns_rows)}; "
+                f"streams: {len(summary.get('network_streams') or []) if isinstance(summary.get('network_streams'), list) else 0}."
             ),
             body,
         )
@@ -205,7 +211,7 @@ def build_analysis_pdf(
     story.append(Paragraph("Strings", h2))
     effective_strings = strings if strings else digest.interesting_strings
     str_rows = [[str(s)] for s in effective_strings]
-    story.append(_data_table(["String"], str_rows, [6.1 * inch], body, mono))
+    story.extend(_chunked_tables(["String"], str_rows, [6.1 * inch], body, mono))
     story.append(PageBreak())
 
     # Process behavior
@@ -241,7 +247,15 @@ def build_analysis_pdf(
             story.append(Paragraph(_esc(line), mono))
         story.append(Spacer(1, 0.08 * inch))
         story.append(Paragraph("Per-Process Detail", h2))
-        story.append(_data_table(["PID", "Parent PID", "Name", "Full Path", "Command Line"], p_rows, [0.5 * inch, 0.7 * inch, 1.0 * inch, 1.8 * inch, 2.0 * inch], body, mono))
+        story.extend(
+            _chunked_tables(
+                ["PID", "Parent PID", "Name", "Full Path", "Command Line"],
+                p_rows,
+                [0.5 * inch, 0.7 * inch, 1.0 * inch, 1.8 * inch, 2.0 * inch],
+                body,
+                mono,
+            )
+        )
         story.append(Spacer(1, 0.08 * inch))
         story.append(Paragraph("Files Touched (per process)", h2))
         f_rows: list[list[str]] = []
@@ -262,13 +276,13 @@ def build_analysis_pdf(
             if isinstance(p.get("mutants"), list):
                 for mt in p.get("mutants"):
                     m_rows.append([pid, str(mt)])
-        story.append(_data_table(["PID", "Action", "Path"], f_rows, [0.6 * inch, 0.8 * inch, 4.7 * inch], body, mono))
+        story.extend(_chunked_tables(["PID", "Action", "Path"], f_rows, [0.6 * inch, 0.8 * inch, 4.7 * inch], body, mono))
         story.append(Spacer(1, 0.08 * inch))
         story.append(Paragraph("Registry Activity (per process)", h2))
-        story.append(_data_table(["PID", "Action", "Registry Key"], r_rows, [0.6 * inch, 0.8 * inch, 4.7 * inch], body, mono))
+        story.extend(_chunked_tables(["PID", "Action", "Registry Key"], r_rows, [0.6 * inch, 0.8 * inch, 4.7 * inch], body, mono))
         story.append(Spacer(1, 0.08 * inch))
         story.append(Paragraph("Mutexes Created", h2))
-        story.append(_data_table(["PID", "Mutex"], m_rows, [0.7 * inch, 5.4 * inch], body, mono))
+        story.extend(_chunked_tables(["PID", "Mutex"], m_rows, [0.7 * inch, 5.4 * inch], body, mono))
     else:
         story.append(Paragraph("No activity observed — processes endpoint returned empty payload.", body))
     story.append(PageBreak())
@@ -277,15 +291,72 @@ def build_analysis_pdf(
     story.append(Paragraph("Behavioral Analysis", h1))
     story.append(Paragraph("Process execution timeline", h2))
     proc_rows = [[r[0], r[1], r[2], r[3], r[4]] for r in digest.process_rows]
-    story.append(_data_table(["PID", "PPID", "Image/Name", "Command Line", "Source"], proc_rows, [0.55 * inch, 0.55 * inch, 1.3 * inch, 3.0 * inch, 0.7 * inch], body, mono))
+    story.extend(
+        _chunked_tables(
+            ["PID", "PPID", "Image/Name", "Command Line", "Source"],
+            proc_rows,
+            [0.55 * inch, 0.55 * inch, 1.3 * inch, 3.0 * inch, 0.7 * inch],
+            body,
+            mono,
+        )
+    )
     story.append(Spacer(1, 0.08 * inch))
     story.append(Paragraph("File system activity", h2))
     fs_rows = [[r[0], r[1], r[2], r[3]] for r in digest.file_activity_rows]
-    story.append(_data_table(["Action", "Path", "Details", "Source"], fs_rows, [0.8 * inch, 2.7 * inch, 1.6 * inch, 1.0 * inch], body, mono))
+    story.extend(
+        _chunked_tables(["Action", "Path", "Details", "Source"], fs_rows, [0.8 * inch, 2.7 * inch, 1.6 * inch, 1.0 * inch], body, mono)
+    )
     story.append(Spacer(1, 0.08 * inch))
     story.append(Paragraph("Registry activity", h2))
     reg_rows = [[r[0], r[1], r[2]] for r in digest.registry_rows]
-    story.append(_data_table(["Action", "Registry Key", "Value/Data"], reg_rows, [0.8 * inch, 3.2 * inch, 2.1 * inch], body, mono))
+    story.extend(_chunked_tables(["Action", "Registry Key", "Value/Data"], reg_rows, [0.8 * inch, 3.2 * inch, 2.1 * inch], body, mono))
+    story.append(PageBreak())
+
+    story.append(Paragraph("Threat signatures (full report)", h2))
+    story.extend(
+        _chunked_tables(
+            ["Threat / Name", "Category", "Description"],
+            [[r[0], r[1], r[2]] for r in digest.signature_rows],
+            [1.4 * inch, 1.0 * inch, 3.7 * inch],
+            body,
+            mono,
+        )
+    )
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(Paragraph("MITRE ATT&CK (full report)", h2))
+    story.extend(
+        _chunked_tables(
+            ["Tactic", "Technique", "ID", "Description"],
+            [[r[0], r[1], r[2], r[3]] for r in digest.mitre_rows],
+            [1.0 * inch, 1.0 * inch, 0.7 * inch, 3.4 * inch],
+            body,
+            mono,
+        )
+    )
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(Paragraph("Mutexes and services / scheduled tasks (full report)", h2))
+    story.extend(_chunked_tables(["Mutex"], [[r[0]] for r in digest.mutex_rows], [6.1 * inch], body, mono))
+    story.append(Spacer(1, 0.06 * inch))
+    story.extend(
+        _chunked_tables(
+            ["Name / item", "Path / command", "Kind"],
+            [[r[0], r[1], r[2]] for r in digest.service_task_rows],
+            [1.4 * inch, 4.0 * inch, 0.7 * inch],
+            body,
+            mono,
+        )
+    )
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(Paragraph("Execution timeline (full report)", h2))
+    story.extend(
+        _chunked_tables(
+            ["Time", "Type", "Detail"],
+            [[r[0], r[1], r[2]] for r in digest.timeline_rows],
+            [0.9 * inch, 0.9 * inch, 4.3 * inch],
+            body,
+            mono,
+        )
+    )
     story.append(PageBreak())
 
     # Network activity
@@ -298,7 +369,7 @@ def build_analysis_pdf(
             dns_rows.append([str(d.get("domain") or d.get("host") or d), str(d.get("ip") or d.get("resolved_ip") or ""), str(d.get("timestamp") or d.get("time") or "")])
         else:
             dns_rows.append([str(d), "", ""])
-    story.append(_data_table(["Domain Queried", "Resolved IP(s)", "Timestamp"], dns_rows, [2.5 * inch, 1.7 * inch, 1.9 * inch], body, mono))
+    story.extend(_chunked_tables(["Domain Queried", "Resolved IP(s)", "Timestamp"], dns_rows, [2.5 * inch, 1.7 * inch, 1.9 * inch], body, mono))
     story.append(Spacer(1, 0.08 * inch))
 
     story.append(Paragraph("HTTP Requests", h2))
@@ -318,7 +389,15 @@ def build_analysis_pdf(
             )
         else:
             http_rows.append(["", str(h), "", "", "", ""])
-    story.append(_data_table(["Method", "Full URL", "User-Agent", "Response", "Length", "Timestamp"], http_rows, [0.6 * inch, 2.0 * inch, 1.2 * inch, 0.7 * inch, 0.6 * inch, 1.0 * inch], body, mono))
+    story.extend(
+        _chunked_tables(
+            ["Method", "Full URL", "User-Agent", "Response", "Length", "Timestamp"],
+            http_rows,
+            [0.6 * inch, 2.0 * inch, 1.2 * inch, 0.7 * inch, 0.6 * inch, 1.0 * inch],
+            body,
+            mono,
+        )
+    )
     story.append(Spacer(1, 0.08 * inch))
 
     story.append(Paragraph("Raw Connections", h2))
@@ -331,8 +410,49 @@ def build_analysis_pdf(
             conn_rows.append([src, dst, str(c.get("protocol") or c.get("transport") or ""), str(c.get("bytes_sent") or c.get("sent") or ""), str(c.get("bytes_received") or c.get("received") or "")])
         else:
             conn_rows.append(["", str(c), "", "", ""])
-    story.append(_data_table(["Source IP:Port", "Destination IP:Port", "Protocol", "Bytes Sent", "Bytes Received"], conn_rows, [1.5 * inch, 1.7 * inch, 0.8 * inch, 1.0 * inch, 1.1 * inch], body, mono))
+    story.extend(
+        _chunked_tables(
+            ["Source IP:Port", "Destination IP:Port", "Protocol", "Bytes Sent", "Bytes Received"],
+            conn_rows,
+            [1.5 * inch, 1.7 * inch, 0.8 * inch, 1.0 * inch, 1.1 * inch],
+            body,
+            mono,
+        )
+    )
     story.append(Spacer(1, 0.08 * inch))
+
+    if digest.network_dns_rows or digest.network_http_rows or digest.network_ip_rows:
+        story.append(Paragraph("Network flows (full JSON report — behavior.network)", h2))
+        story.extend(
+            _chunked_tables(
+                ["Proto", "Domain / host", "IP", "Port", "Request / detail"],
+                [[r[0], r[1], r[2], r[3], r[4] if len(r) > 4 else ""] for r in digest.network_dns_rows],
+                [0.5 * inch, 1.6 * inch, 1.2 * inch, 0.5 * inch, 2.3 * inch],
+                body,
+                mono,
+            )
+        )
+        story.append(Spacer(1, 0.06 * inch))
+        story.extend(
+            _chunked_tables(
+                ["Proto", "URI / URL", "IP", "Port"],
+                [[r[0], r[1], r[2], r[3]] for r in digest.network_http_rows],
+                [0.5 * inch, 3.5 * inch, 1.2 * inch, 0.9 * inch],
+                body,
+                mono,
+            )
+        )
+        story.append(Spacer(1, 0.06 * inch))
+        story.extend(
+            _chunked_tables(
+                ["IP", "Port", "Proto", "Related domain"],
+                [[r[0], r[1], r[2], r[3] if len(r) > 3 else ""] for r in digest.network_ip_rows],
+                [1.3 * inch, 0.7 * inch, 0.8 * inch, 3.3 * inch],
+                body,
+                mono,
+            )
+        )
+        story.append(Spacer(1, 0.08 * inch))
 
     story.append(Paragraph("Compromised / Flagged Hosts", h2))
     host_rows: list[list[str]] = []
@@ -364,9 +484,27 @@ def build_analysis_pdf(
                     str(d.get("verdict") or d.get("type") or ""),
                 ]
             )
-        story.append(_data_table(["Name", "Drop Path", "Size", "MD5", "SHA256", "Verdict"], d_rows, [0.9 * inch, 1.5 * inch, 0.5 * inch, 1.0 * inch, 1.2 * inch, 0.8 * inch], body, mono))
+        story.extend(
+            _chunked_tables(
+                ["Name", "Drop Path", "Size", "MD5", "SHA256", "Verdict"],
+                d_rows,
+                [0.9 * inch, 1.5 * inch, 0.5 * inch, 1.0 * inch, 1.2 * inch, 0.8 * inch],
+                body,
+                mono,
+            )
+        )
+    elif digest.dropped_file_rows:
+        story.extend(
+            _chunked_tables(
+                ["SHA256 / hash", "Path / name", "Type / size"],
+                [[r[0], r[1], r[2]] for r in digest.dropped_file_rows],
+                [1.3 * inch, 3.5 * inch, 1.3 * inch],
+                body,
+                mono,
+            )
+        )
     else:
-        story.append(Paragraph("No activity observed — dropped-files endpoint returned empty payload.", body))
+        story.append(Paragraph("No dropped-file rows from dropped-files or dropped-files-v2 API.", body))
     story.append(PageBreak())
 
     # Execution screenshots
@@ -394,15 +532,9 @@ def build_analysis_pdf(
             story.append(Spacer(1, 0.1 * inch))
     else:
         if shot_index_rows:
-            story.append(Paragraph("Screenshot metadata exists, but binary image download was unavailable via API in this run.", body))
+            story.append(Paragraph("Screenshot list/metadata present; binary GET returned no decodable image (check API key tier and paths).", body))
         else:
-            story.append(
-                Paragraph(
-                    "The Hybrid Analysis platform returned no screenshots for this execution. This may indicate the sample ran as a "
-                    "background or headless process without spawning a visible GUI window during the analysis period.",
-                    body,
-                )
-            )
+            story.append(Paragraph("No screenshot entries in API response for this job.", body))
     story.append(PageBreak())
 
     # Threat classification
@@ -417,6 +549,7 @@ def build_analysis_pdf(
     # IOC section
     story.append(Paragraph("Indicators of Compromise", h1))
     ioc = build_ioc_summary(summary, processes, dropped)
+    _ioc_merge_digest(ioc, digest)
     story.append(Paragraph("FILE HASHES", h2))
     story.append(_data_table(["MD5", "SHA1", "SHA256", "File Name"], [[str(summary.get("md5") or ""), str(summary.get("sha1") or ""), str(summary.get("sha256") or ""), str(summary.get("submit_name") or source_file.name)]], [1.4 * inch, 1.4 * inch, 2.2 * inch, 1.1 * inch], body, mono))
     story.append(Spacer(1, 0.06 * inch))
@@ -446,8 +579,24 @@ def build_analysis_pdf(
 
     # Appendix
     story.append(Paragraph("Appendix", h1))
+    story.append(Paragraph("Flattened summary keys (all scalar / compact JSON values returned by API)", h2))
+    story.extend(
+        _chunked_tables(
+            ["Key", "Value"],
+            [[k, v] for k, v in digest.classification_rows],
+            [2.2 * inch, 3.9 * inch],
+            body,
+            mono,
+        )
+    )
+    story.append(PageBreak())
+    story.append(Paragraph("Telemetry path index (summary + report branches)", h2))
+    for ln in digest.appendix_telemetry_lines[:900]:
+        story.append(Paragraph(_esc(ln), mono))
+    story.append(PageBreak())
     story.extend(_json_block("Analysis Environment", {"environment_description": summary.get("environment_description"), "environment_id": summary.get("environment_id")}, mono, body))
-    story.extend(_json_block("Summary JSON (excerpt)", summary, mono, body))
+    story.extend(_json_block("Summary JSON (full)", summary, mono, body, max_lines=12000))
+    story.extend(_json_block("Full report JSON (full)", outcome.full_report, mono, body, max_lines=12000))
     story.extend(_json_block("Memory Dump Notes", memory_dumps, mono, body))
     story.extend(_json_block("Hash Verification", {"md5": summary.get("md5"), "sha1": summary.get("sha1"), "sha256": summary.get("sha256")}, mono, body))
 
@@ -507,7 +656,14 @@ def build_recommendation_text(summary: dict[str, Any], ioc: dict[str, list[str]]
     return "No activity observed — API verdict does not indicate malicious or suspicious behavior requiring containment."
 
 
-def _json_block(title: str, payload: Any, mono: ParagraphStyle, body: ParagraphStyle) -> list[Any]:
+def _json_block(
+    title: str,
+    payload: Any,
+    mono: ParagraphStyle,
+    body: ParagraphStyle,
+    *,
+    max_lines: int = 8000,
+) -> list[Any]:
     out: list[Any] = [Paragraph(_esc(title), body)]
     if payload in (None, [], {}):
         out.append(Paragraph("No activity observed — endpoint returned empty payload.", body))
@@ -517,8 +673,15 @@ def _json_block(title: str, payload: Any, mono: ParagraphStyle, body: ParagraphS
         blob = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         blob = str(payload)
-    for ln in blob.splitlines()[:140]:
+    lines = blob.splitlines()
+    cap = min(len(lines), max_lines)
+    for i, ln in enumerate(lines[:cap]):
+        if i > 0 and i % 95 == 0:
+            out.append(PageBreak())
+            out.append(Paragraph(_esc(f"{title} (continued)"), body))
         out.append(Paragraph(_esc(ln), mono))
+    if len(lines) > cap:
+        out.append(Paragraph(_esc(f"… truncated after {cap} lines ({len(lines)} total)."), body))
     out.append(Spacer(1, 0.06 * inch))
     return out
 
@@ -551,11 +714,71 @@ def _draw_page_frame(canvas: Any, doc: _HADocTemplate) -> None:
     canvas.restoreState()
 
 
+def _chunked_tables(
+    headers: list[str],
+    rows: list[list[str]],
+    widths: list[float],
+    body: ParagraphStyle,
+    mono: ParagraphStyle,
+    *,
+    chunk_size: int = 90,
+) -> list[Any]:
+    blocks: list[Any] = []
+    if not rows:
+        return [_data_table(headers, rows, widths, body, mono)]
+    total = len(rows)
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        blocks.append(_data_table(headers, rows[start:end], widths, body, mono))
+        if end < total:
+            blocks.append(Spacer(1, 0.04 * inch))
+            blocks.append(Paragraph(_esc(f"(continued: rows {start + 1}–{end} of {total})"), body))
+    return blocks
+
+
+def _ioc_merge_digest(ioc: dict[str, list[str]], digest: Any) -> None:
+    for row in getattr(digest, "network_dns_rows", []) or []:
+        if len(row) > 1 and row[1]:
+            ioc.setdefault("domains", []).append(str(row[1]))
+        if len(row) > 2 and row[2]:
+            ip = str(row[2])
+            if _looks_like_ip(ip):
+                ioc.setdefault("ips", []).append(ip)
+    for row in getattr(digest, "network_http_rows", []) or []:
+        if len(row) > 1 and row[1]:
+            ioc.setdefault("urls", []).append(str(row[1]))
+        if len(row) > 2 and row[2] and _looks_like_ip(str(row[2])):
+            ioc.setdefault("ips", []).append(str(row[2]))
+    for row in getattr(digest, "network_ip_rows", []) or []:
+        if row and row[0]:
+            ioc.setdefault("ips", []).append(str(row[0]))
+    for row in getattr(digest, "mutex_rows", []) or []:
+        if row and row[0]:
+            ioc.setdefault("mutexes", []).append(str(row[0]))
+    for row in getattr(digest, "registry_rows", []) or []:
+        if len(row) > 1 and row[1]:
+            ioc.setdefault("regkeys", []).append(str(row[1]))
+    for row in getattr(digest, "file_activity_rows", []) or []:
+        if len(row) > 1 and row[1]:
+            ioc.setdefault("filepaths", []).append(str(row[1]))
+    for key in ("ips", "domains", "urls", "mutexes", "regkeys", "filepaths", "hashes"):
+        if key in ioc and isinstance(ioc[key], list):
+            ioc[key] = sorted(set(ioc[key]))
+
+
+def _looks_like_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s.strip().split("%", 1)[0])
+        return True
+    except ValueError:
+        return False
+
+
 def _data_table(headers: list[str], rows: list[list[str]], widths: list[float], body: ParagraphStyle, mono: ParagraphStyle) -> Table:
     if not rows:
         rows = [["No activity observed — endpoint returned empty payload."] + [""] * (len(headers) - 1)]
     data = [[Paragraph(f"<b>{_esc(h)}</b>", body) for h in headers]]
-    data.extend([[Paragraph(_esc(c), mono) for c in r] for r in rows[:300]])
+    data.extend([[Paragraph(_esc(c), mono) for c in r] for r in rows])
     t = Table(data, colWidths=widths, repeatRows=1)
     t.setStyle(
         TableStyle(
