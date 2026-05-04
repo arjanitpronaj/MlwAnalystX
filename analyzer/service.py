@@ -244,6 +244,8 @@ class AnalysisService:
                     screenshot_items = nested
             if isinstance(screenshot_items, list):
                 for idx, item in enumerate(screenshot_items, start=1):
+                    if isinstance(item, str):
+                        item = {"reference": item, "name": f"screenshot_{idx}"}
                     if not isinstance(item, dict):
                         continue
                     refs: list[str] = []
@@ -256,6 +258,8 @@ class AnalysisService:
                     if isinstance(ref, str) and ref.strip():
                         parsed = urlparse(ref)
                         candidate_path = parsed.path if parsed.scheme and parsed.netloc else ref
+                        if parsed.scheme and parsed.netloc:
+                            refs.append(ref)
                         if candidate_path.startswith("/"):
                             refs.append(candidate_path)
                         else:
@@ -266,9 +270,13 @@ class AnalysisService:
                         if tok:
                             refs.append(f"/report/{job_id}/screenshots/{tok}")
                             refs.append(f"/report/{job_id}/screenshot/{tok}")
+                            refs.append(f"/report/{job_id}/screenshots/{tok}/raw")
                     refs.append(f"/report/{report_sha256}/screenshots/{idx}")
                     refs.append(f"/report/{report_sha256}/screenshots/{idx - 1}")
                     refs.append(f"/report/{report_sha256}/screenshot/{idx}")
+                    refs.append(f"/report/{job_id}/screenshots/{idx}")
+                    refs.append(f"/report/{job_id}/screenshot/{idx}")
+                    refs.append(f"/report/{job_id}/screenshots/{idx}/raw")
 
                     blob: bytes | None = None
                     seen_paths: set[str] = set()
@@ -284,6 +292,7 @@ class AnalysisService:
                         screenshot_images.append(
                             {
                                 "name": str(item.get("name") or item.get("id") or f"screenshot_{idx}"),
+                                "timestamp": str(item.get("time") or item.get("timestamp") or item.get("created_at") or ""),
                                 "bytes": blob,
                             }
                         )

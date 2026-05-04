@@ -13,6 +13,7 @@ from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, S
 from reportlab.platypus.tableofcontents import TableOfContents
 
 from analyzer.service import AnalysisOutcome
+from reporting.forensic_digest import build_forensic_digest
 
 
 class _HADocTemplate(SimpleDocTemplate):
@@ -47,6 +48,7 @@ def build_analysis_pdf(
     memory_dumps = sup.get("memory_dumps")
     screenshots = sup.get("screenshot_images") if isinstance(sup.get("screenshot_images"), list) else []
     pcap_summary = sup.get("pcap_summary") if isinstance(sup.get("pcap_summary"), dict) else {}
+    digest = build_forensic_digest(outcome.full_report, summary, sup, outcome.milestones)
 
     styles = getSampleStyleSheet()
     h1 = ParagraphStyle("HA_H1", parent=styles["Heading1"], textColor=colors.HexColor("#005f73"))
@@ -100,6 +102,12 @@ def build_analysis_pdf(
             body,
         )
     )
+    story.append(PageBreak())
+
+    # Malware classification signals (API-derived only)
+    story.append(Paragraph("Malware Classification Signals", h1))
+    signals = _extract_classification_signals(summary, outcome.full_report)
+    story.append(_data_table(["Signal Type", "Value"], [[k, v] for k, v in signals], [1.8 * inch, 4.3 * inch], body, mono))
     story.append(PageBreak())
 
     # File information
@@ -195,17 +203,24 @@ def build_analysis_pdf(
     story.append(Spacer(1, 0.08 * inch))
 
     story.append(Paragraph("Strings", h2))
-    str_rows = [[str(s)] for s in strings]
+    effective_strings = strings if strings else digest.interesting_strings
+    str_rows = [[str(s)] for s in effective_strings]
     story.append(_data_table(["String"], str_rows, [6.1 * inch], body, mono))
     story.append(PageBreak())
 
     # Process behavior
     story.append(Paragraph("Process Behavior", h1))
-    if processes:
+    process_rows_for_pdf = processes
+    if not process_rows_for_pdf and digest.process_rows:
+        process_rows_for_pdf = [
+            {"pid": r[0], "parentpid": r[1], "name": r[2], "normalized_path": r[2], "cmdline": r[3]}
+            for r in digest.process_rows
+        ]
+    if process_rows_for_pdf:
         p_rows = []
         by_pid: dict[str, dict[str, Any]] = {}
         children: dict[str, list[str]] = {}
-        for p in processes:
+        for p in process_rows_for_pdf:
             if not isinstance(p, dict):
                 continue
             pid = str(p.get("pid") or "")
@@ -232,7 +247,7 @@ def build_analysis_pdf(
         f_rows: list[list[str]] = []
         r_rows: list[list[str]] = []
         m_rows: list[list[str]] = []
-        for p in processes:
+        for p in process_rows_for_pdf:
             if not isinstance(p, dict):
                 continue
             pid = str(p.get("pid") or "")
@@ -256,6 +271,21 @@ def build_analysis_pdf(
         story.append(_data_table(["PID", "Mutex"], m_rows, [0.7 * inch, 5.4 * inch], body, mono))
     else:
         story.append(Paragraph("No activity observed — processes endpoint returned empty payload.", body))
+    story.append(PageBreak())
+
+    # Behavioral analysis sync block (full report + supplemental)
+    story.append(Paragraph("Behavioral Analysis", h1))
+    story.append(Paragraph("Process execution timeline", h2))
+    proc_rows = [[r[0], r[1], r[2], r[3], r[4]] for r in digest.process_rows]
+    story.append(_data_table(["PID", "PPID", "Image/Name", "Command Line", "Source"], proc_rows, [0.55 * inch, 0.55 * inch, 1.3 * inch, 3.0 * inch, 0.7 * inch], body, mono))
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(Paragraph("File system activity", h2))
+    fs_rows = [[r[0], r[1], r[2], r[3]] for r in digest.file_activity_rows]
+    story.append(_data_table(["Action", "Path", "Details", "Source"], fs_rows, [0.8 * inch, 2.7 * inch, 1.6 * inch, 1.0 * inch], body, mono))
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(Paragraph("Registry activity", h2))
+    reg_rows = [[r[0], r[1], r[2]] for r in digest.registry_rows]
+    story.append(_data_table(["Action", "Registry Key", "Value/Data"], reg_rows, [0.8 * inch, 3.2 * inch, 2.1 * inch], body, mono))
     story.append(PageBreak())
 
     # Network activity
@@ -341,6 +371,10 @@ def build_analysis_pdf(
 
     # Execution screenshots
     story.append(Paragraph("Execution Screenshots", h1))
+    shot_index_rows = digest.screenshot_index
+    if shot_index_rows:
+        story.append(_data_table(["#", "Name/Slot", "Reference"], shot_index_rows, [0.5 * inch, 1.8 * inch, 3.8 * inch], body, mono))
+        story.append(Spacer(1, 0.08 * inch))
     if screenshots:
         for i, shot in enumerate(screenshots, start=1):
             if not isinstance(shot, dict):
@@ -359,13 +393,16 @@ def build_analysis_pdf(
             story.append(Paragraph("Caption: Screenshot captured by Hybrid Analysis sandbox execution timeline.", small))
             story.append(Spacer(1, 0.1 * inch))
     else:
-        story.append(
-            Paragraph(
-                "The Hybrid Analysis platform returned no screenshots for this execution. This may indicate the sample ran as a "
-                "background or headless process without spawning a visible GUI window during the analysis period.",
-                body,
+        if shot_index_rows:
+            story.append(Paragraph("Screenshot metadata exists, but binary image download was unavailable via API in this run.", body))
+        else:
+            story.append(
+                Paragraph(
+                    "The Hybrid Analysis platform returned no screenshots for this execution. This may indicate the sample ran as a "
+                    "background or headless process without spawning a visible GUI window during the analysis period.",
+                    body,
+                )
             )
-        )
     story.append(PageBreak())
 
     # Threat classification
@@ -550,6 +587,42 @@ def _verdict_color(verdict: str) -> str:
     if v in ("clean", "no specific threat"):
         return "#2e7d32"
     return "#616161"
+
+
+def _extract_classification_signals(summary: dict[str, Any], full_report: dict[str, Any] | list[Any]) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    rows.append(("Verdict", str(summary.get("verdict") or "No activity observed — field not returned by API")))
+    rows.append(("Threat Score", str(summary.get("threat_score") or "No activity observed — field not returned by API")))
+    rows.append(("Family", str(summary.get("vx_family") or "No activity observed — field not returned by API")))
+    tags = summary.get("classification_tags") if isinstance(summary.get("classification_tags"), list) else []
+    if tags:
+        rows.append(("Classification Tags", ", ".join(str(x) for x in tags[:30])))
+    else:
+        rows.append(("Classification Tags", "No activity observed — API returned empty tags"))
+    text_blob_parts: list[str] = []
+    for source in (
+        summary.get("vx_family"),
+        summary.get("verdict"),
+        summary.get("threat_level"),
+        ", ".join(str(x) for x in tags),
+    ):
+        if source:
+            text_blob_parts.append(str(source))
+    if isinstance(full_report, dict):
+        sigs = full_report.get("signatures")
+        if isinstance(sigs, list):
+            for s in sigs[:80]:
+                if isinstance(s, dict):
+                    text_blob_parts.append(str(s.get("name") or s.get("threat") or s.get("description") or ""))
+                else:
+                    text_blob_parts.append(str(s))
+    blob = " ".join(text_blob_parts).lower()
+    families = []
+    for key in ("ransom", "trojan", "worm", "backdoor", "stealer", "dropper", "loader", "botnet", "spyware", "keylogger"):
+        if key in blob:
+            families.append(key)
+    rows.append(("Detected Classification Keywords", ", ".join(sorted(set(families))) if families else "No activity observed — none present in API text fields"))
+    return rows
 
 
 def _esc(text: str) -> str:

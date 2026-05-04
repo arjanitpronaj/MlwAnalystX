@@ -59,7 +59,10 @@ class HybridAnalysisClient:
         files: dict[str, Any] | None = None,
         stream: bool = False,
     ) -> requests.Response:
-        url = f"{self._settings.api_base_url.rstrip('/')}{path}"
+        if path.startswith("http://") or path.startswith("https://"):
+            url = path
+        else:
+            url = f"{self._settings.api_base_url.rstrip('/')}{path}"
         timeout = (self._settings.connect_timeout_sec, self._settings.read_timeout_sec)
         attempt = 0
         last_exc: Exception | None = None
