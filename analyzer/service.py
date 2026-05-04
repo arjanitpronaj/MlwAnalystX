@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import math
 import time
 from collections.abc import Callable
@@ -256,6 +258,28 @@ class AnalysisService:
                         item = {"reference": item, "name": f"screenshot_{idx}"}
                     if not isinstance(item, dict):
                         continue
+                    # Falcon Sandbox API returns screenshots as JSON with base64 "image" (OpenAPI SampleScreenshot).
+                    b64_img = item.get("image") or item.get("Image")
+                    if isinstance(b64_img, str) and b64_img.strip():
+                        raw = b64_img.strip()
+                        if raw.startswith("data:") and "," in raw:
+                            raw = raw.split(",", 1)[-1]
+                        pad = (-len(raw)) % 4
+                        if pad:
+                            raw += "=" * pad
+                        try:
+                            img_bytes = base64.b64decode(raw, validate=False)
+                        except (binascii.Error, ValueError):
+                            img_bytes = b""
+                        if img_bytes and len(img_bytes) >= 32 and len(img_bytes) <= self._settings.max_screenshot_bytes:
+                            screenshot_images.append(
+                                {
+                                    "name": str(item.get("name") or f"screenshot_{idx}"),
+                                    "timestamp": str(item.get("date") or item.get("time") or item.get("timestamp") or ""),
+                                    "bytes": img_bytes,
+                                }
+                            )
+                            continue
                     refs: list[str] = []
                     ref = (
                         item.get("screenshot")
@@ -285,6 +309,12 @@ class AnalysisService:
                     refs.append(f"/report/{job_id}/screenshots/{idx}")
                     refs.append(f"/report/{job_id}/screenshot/{idx}")
                     refs.append(f"/report/{job_id}/screenshots/{idx}/raw")
+                    env_id = summary.get("environment_id")
+                    if env_id is not None:
+                        comp = f"{report_sha256}:{env_id}"
+                        refs.append(f"/report/{comp}/screenshots/{idx}")
+                        refs.append(f"/report/{comp}/screenshot/{idx}")
+                        refs.append(f"/report/{comp}/screenshots/{idx}/raw")
 
                     blob: bytes | None = None
                     seen_paths: set[str] = set()

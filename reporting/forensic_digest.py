@@ -69,6 +69,87 @@ def _dig(root: dict[str, Any], *path: str) -> Any:
     return cur
 
 
+def _enrich_root_from_summary(root: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+    """
+    When full /report/{job}/report/json is empty or 403, the job summary often still
+    contains processes, network, and registry slices matching the web UI.
+    """
+    if not isinstance(summary, dict):
+        return root
+    out = dict(root)
+    beh = dict(out.get("behavior") or {}) if isinstance(out.get("behavior"), dict) else {}
+
+    if summary.get("processes"):
+        if not out.get("processes"):
+            out["processes"] = summary["processes"]
+        if not beh.get("processes"):
+            beh["processes"] = summary["processes"]
+
+    pt = summary.get("process_tree")
+    if isinstance(pt, dict) and not out.get("process_tree"):
+        out["process_tree"] = pt
+    if isinstance(pt, dict) and not beh.get("process_tree"):
+        beh["process_tree"] = pt
+
+    for key in ("signatures", "mitre_attcks", "mitre_attacks"):
+        if summary.get(key) and not out.get(key):
+            out[key] = summary[key]
+
+    for rk in ("registry_keys_set", "registry_keys_deleted", "registry_keys_monitored"):
+        if summary.get(rk) and not beh.get(rk):
+            beh[rk] = summary[rk]
+
+    for fk in ("extracted_files", "dropped_files", "files_created", "files_modified", "files_deleted", "file_created"):
+        if summary.get(fk) and not out.get(fk):
+            out[fk] = summary[fk]
+
+    synth_flows: list[dict[str, Any]] = []
+    for d in _as_list(summary.get("dns_requests")):
+        if isinstance(d, dict):
+            synth_flows.append(
+                {
+                    "protocol": "DNS",
+                    "domain": d.get("domain") or d.get("host"),
+                    "ip": d.get("ip") or d.get("resolved_ip"),
+                    "request": d.get("request") or d.get("query"),
+                }
+            )
+        elif isinstance(d, str) and d:
+            synth_flows.append({"protocol": "DNS", "domain": d, "ip": "", "request": ""})
+    for h in _as_list(summary.get("http_requests")):
+        if isinstance(h, dict):
+            synth_flows.append(
+                {
+                    "protocol": str(h.get("method") or "HTTP"),
+                    "url": h.get("url") or h.get("uri"),
+                    "uri": h.get("uri"),
+                    "ip": h.get("host") or h.get("ip"),
+                    "dport": h.get("port"),
+                }
+            )
+    for c in _as_list(summary.get("network_streams")):
+        if isinstance(c, dict):
+            synth_flows.append(
+                {
+                    "protocol": c.get("protocol") or c.get("transport"),
+                    "ip": c.get("dst_ip") or c.get("destination_ip"),
+                    "domain": c.get("domain") or c.get("host"),
+                    "dport": c.get("dst_port") or c.get("dport"),
+                    "src_ip": c.get("src_ip") or c.get("source_ip"),
+                }
+            )
+
+    if synth_flows:
+        net = dict(beh.get("network") or {}) if isinstance(beh.get("network"), dict) else {}
+        cur = _as_list(net.get("flows"))
+        net["flows"] = cur + synth_flows
+        beh["network"] = net
+
+    if beh:
+        out["behavior"] = beh
+    return out
+
+
 @dataclass
 class ForensicDigest:
     """Structured material for a multi-section autopsy-style PDF."""
@@ -150,7 +231,9 @@ def _collect_process_rows(root: dict[str, Any]) -> list[list[str]]:
     return rows[:800]
 
 
-def _collect_file_rows(root: dict[str, Any], supplemental: dict[str, Any]) -> list[list[str]]:
+def _collect_file_rows(
+    root: dict[str, Any], supplemental: dict[str, Any], summary: dict[str, Any] | None = None
+) -> list[list[str]]:
     rows: list[list[str]] = []
     seen: set[str] = set()
 
@@ -198,10 +281,18 @@ def _collect_file_rows(root: dict[str, Any], supplemental: dict[str, Any]) -> li
             if isinstance(item, dict):
                 add("dropped", str(item.get("path") or item.get("name") or ""), str(item.get("sha256") or ""), "API")
 
+    sum_d = summary if isinstance(summary, dict) else {}
+    for p in _as_list(sum_d.get("processes")):
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("pid") or "")
+        for key, act in (("created_files", "created"), ("deleted_files", "deleted"), ("modified_files", "modified")):
+            for fp in _as_list(p.get(key)):
+                add(act, str(fp), f"pid={pid}", "summary.processes")
     return rows[:900]
 
 
-def _collect_registry_rows(root: dict[str, Any]) -> list[list[str]]:
+def _collect_registry_rows(root: dict[str, Any], summary: dict[str, Any] | None = None) -> list[list[str]]:
     rows: list[list[str]] = []
     beh = root.get("behavior")
     if not isinstance(beh, dict):
@@ -226,7 +317,44 @@ def _collect_registry_rows(root: dict[str, Any]) -> list[list[str]]:
             elif isinstance(item, str) and item not in seen:
                 seen.add(item)
                 rows.append(["set", _s(item, 1200), ""])
-    return rows[:500]
+
+    s = summary if isinstance(summary, dict) else {}
+    for block_name, act in (
+        ("registry_keys_set", "set"),
+        ("registry_keys_deleted", "delete"),
+        ("registry_keys_monitored", "monitored"),
+    ):
+        for item in _as_list(s.get(block_name)):
+            if isinstance(item, dict):
+                k = str(item.get("key") or item.get("path") or item.get("name") or "")
+                v = str(item.get("value") or item.get("data") or "")
+                line = f"{act}|{k}|{v}"
+                if k and line not in seen:
+                    seen.add(line)
+                    rows.append([_s(act, 24), _s(k, 900), _s(v, 600)])
+            elif isinstance(item, str) and item not in seen:
+                seen.add(item)
+                rows.append([act, _s(item, 1200), ""])
+
+    for p in _as_list(s.get("processes")):
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("pid") or "")
+        for key, act in (("registry_keys_set", "set"), ("registry_keys_deleted", "delete")):
+            for rk in _as_list(p.get(key)):
+                if isinstance(rk, str):
+                    line = f"{act}|{rk}|{pid}"
+                    if line not in seen:
+                        seen.add(line)
+                        rows.append([_s(act, 24), _s(rk, 900), f"pid={pid}"])
+                elif isinstance(rk, dict):
+                    k = str(rk.get("key") or rk.get("path") or rk.get("name") or "")
+                    v = str(rk.get("value") or rk.get("data") or "")
+                    line = f"{act}|{k}|{v}|{pid}"
+                    if k and line not in seen:
+                        seen.add(line)
+                        rows.append([_s(act, 24), _s(k, 900), _s(v, 600)])
+    return rows[:800]
 
 
 def _collect_network_rows(root: dict[str, Any]) -> tuple[list[list[str]], list[list[str]], list[list[str]]]:
@@ -268,7 +396,9 @@ def _collect_network_rows(root: dict[str, Any]) -> tuple[list[list[str]], list[l
     return dns_r[:400], http_r[:400], ip_r[:300]
 
 
-def _collect_mutex_service(root: dict[str, Any]) -> tuple[list[list[str]], list[list[str]]]:
+def _collect_mutex_service(
+    root: dict[str, Any], summary: dict[str, Any] | None = None
+) -> tuple[list[list[str]], list[list[str]]]:
     mutex: list[list[str]] = []
     svc: list[list[str]] = []
     beh = root.get("behavior")
@@ -287,10 +417,27 @@ def _collect_mutex_service(root: dict[str, Any]) -> tuple[list[list[str]], list[
     for item in _as_list(beh.get("tasks") or beh.get("scheduled_tasks") or root.get("tasks")):
         if isinstance(item, dict):
             svc.append([_s(item.get("name") or item.get("task"), 200), _s(item.get("command") or item.get("path"), 800), "task"])
+
+    s = summary if isinstance(summary, dict) else {}
+    for m in _as_list(s.get("mutexes")):
+        if isinstance(m, dict):
+            mutex.append([_s(m.get("name") or m.get("mutex") or m, 500)])
+        elif isinstance(m, str):
+            mutex.append([_s(m, 500)])
+    for p in _as_list(s.get("processes")):
+        if not isinstance(p, dict):
+            continue
+        for m in _as_list(p.get("mutants") or p.get("mutexes")):
+            if isinstance(m, dict):
+                mutex.append([_s(m.get("name") or m.get("mutex") or m, 500)])
+            elif isinstance(m, str):
+                mutex.append([_s(m, 500)])
     return mutex[:200], svc[:250]
 
 
-def _collect_signatures_mitre(root: dict[str, Any]) -> tuple[list[list[str]], list[list[str]]]:
+def _collect_signatures_mitre(
+    root: dict[str, Any], summary: dict[str, Any] | None = None
+) -> tuple[list[list[str]], list[list[str]]]:
     sigs: list[list[str]] = []
     mitre: list[list[str]] = []
     for sig in _as_list(root.get("signatures") or root.get("classification") or _dig(root, "behavior", "signatures")):
@@ -309,10 +456,32 @@ def _collect_signatures_mitre(root: dict[str, Any]) -> tuple[list[list[str]], li
             mitre.append([_s(m.get("tactic"), 120), _s(m.get("technique"), 120), _s(m.get("identifier") or m.get("id"), 80), _s(m.get("description"), 800)])
         elif isinstance(m, str):
             mitre.append(["", "", _s(m, 80), ""])
+
+    s = summary if isinstance(summary, dict) else {}
+    if not sigs:
+        for sig in _as_list(s.get("signatures")):
+            if isinstance(sig, dict):
+                sigs.append(
+                    [
+                        _s(sig.get("threat") or sig.get("name") or sig.get("identifier"), 200),
+                        _s(sig.get("category") or sig.get("origin"), 120),
+                        _s(sig.get("description") or sig.get("detail"), 1200),
+                    ]
+                )
+            elif isinstance(sig, str):
+                sigs.append([_s(sig, 400), "", ""])
+    if not mitre:
+        for m in _as_list(s.get("mitre_attcks") or s.get("mitre_attacks") or s.get("mitre")):
+            if isinstance(m, dict):
+                mitre.append(
+                    [_s(m.get("tactic"), 120), _s(m.get("technique"), 120), _s(m.get("identifier") or m.get("id"), 80), _s(m.get("description"), 800)]
+                )
+            elif isinstance(m, str):
+                mitre.append(["", "", _s(m, 80), ""])
     return sigs[:350], mitre[:120]
 
 
-def _collect_timeline(root: dict[str, Any]) -> list[list[str]]:
+def _collect_timeline(root: dict[str, Any], summary: dict[str, Any] | None = None) -> list[list[str]]:
     rows: list[list[str]] = []
     beh = root.get("behavior")
     if isinstance(beh, dict):
@@ -322,6 +491,16 @@ def _collect_timeline(root: dict[str, Any]) -> list[list[str]]:
     for ev in _as_list(root.get("timeline")):
         if isinstance(ev, dict):
             rows.append([_s(ev.get("time") or ev.get("timestamp"), 40), _s(ev.get("type") or "event", 40), _s(ev.get("message") or ev.get("action") or ev, 1200)])
+    s = summary if isinstance(summary, dict) else {}
+    for ev in _as_list(s.get("processes")):
+        if isinstance(ev, dict) and (ev.get("time") or ev.get("timestamp")):
+            rows.append(
+                [
+                    _s(ev.get("time") or ev.get("timestamp"), 40),
+                    "process",
+                    _s(ev.get("path") or ev.get("process_name") or ev.get("name") or ev.get("action"), 1200),
+                ]
+            )
     return rows[:500]
 
 
@@ -342,11 +521,15 @@ def _screenshot_rows(supplemental: dict[str, Any]) -> list[list[str]]:
     if isinstance(raw, list):
         for i, item in enumerate(raw):
             if isinstance(item, dict):
+                img = item.get("image") or item.get("Image")
+                ref = item.get("screenshot") or item.get("url") or item.get("path") or ""
+                if isinstance(img, str) and img.strip():
+                    ref = f"base64 image ({len(img)} chars)"
                 rows.append(
                     [
                         str(i + 1),
                         _s(item.get("name") or item.get("file") or item.get("id"), 200),
-                        _s(item.get("screenshot") or item.get("url") or item.get("path"), 800),
+                        _s(ref, 800),
                     ]
                 )
             else:
@@ -454,18 +637,19 @@ def build_forensic_digest(
     milestones: list[tuple[float, str]],
 ) -> ForensicDigest:
     root: dict[str, Any] = full_report if isinstance(full_report, dict) else {}
+    root = _enrich_root_from_summary(root, summary)
 
     digest = ForensicDigest()
     digest.process_rows = _collect_process_rows(root)
-    digest.file_activity_rows = _collect_file_rows(root, supplemental)
-    digest.registry_rows = _collect_registry_rows(root)
+    digest.file_activity_rows = _collect_file_rows(root, supplemental, summary)
+    digest.registry_rows = _collect_registry_rows(root, summary)
     dns, http, ips = _collect_network_rows(root)
     digest.network_dns_rows = dns
     digest.network_http_rows = http
     digest.network_ip_rows = ips
-    digest.mutex_rows, digest.service_task_rows = _collect_mutex_service(root)
-    digest.signature_rows, digest.mitre_rows = _collect_signatures_mitre(root)
-    digest.timeline_rows = _collect_timeline(root)
+    digest.mutex_rows, digest.service_task_rows = _collect_mutex_service(root, summary)
+    digest.signature_rows, digest.mitre_rows = _collect_signatures_mitre(root, summary)
+    digest.timeline_rows = _collect_timeline(root, summary)
     digest.interesting_strings = _collect_interesting_strings(root, summary)
     digest.screenshot_index = _screenshot_rows(supplemental)
     digest.dropped_file_rows = _api_dropped_table(supplemental)

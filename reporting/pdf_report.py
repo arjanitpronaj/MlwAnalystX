@@ -14,7 +14,65 @@ from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, S
 from reportlab.platypus.tableofcontents import TableOfContents
 
 from analyzer.service import AnalysisOutcome
+from config.defaults import Settings
 from reporting.forensic_digest import build_forensic_digest
+
+
+def _malware_classification_matrix(
+    summary: dict[str, Any],
+    digest: Any,
+    outcome: AnalysisOutcome,
+) -> list[tuple[str, str]]:
+    tags = summary.get("classification_tags") if isinstance(summary.get("classification_tags"), list) else []
+    blob = " ".join(str(t) for t in tags).lower()
+    blob += " " + str(summary.get("vx_family") or "").lower()
+    blob += " " + str(summary.get("verdict") or "").lower()
+    for sc in summary.get("scanners") or []:
+        if isinstance(sc, dict):
+            blob += " " + str(sc.get("result") or sc.get("detected_as") or "").lower()
+    for row in getattr(digest, "signature_rows", []) or []:
+        for cell in row:
+            blob += " " + str(cell).lower()
+    hits = (
+        "ransomware",
+        "ransom",
+        "trojan",
+        "worm",
+        "stealer",
+        "dropper",
+        "loader",
+        "keylog",
+        "spyware",
+        "banker",
+        "miner",
+        "botnet",
+        "backdoor",
+        "wiper",
+        "locker",
+        "cryptor",
+        "rootkit",
+    )
+    matched = sorted({h for h in hits if h in blob})
+    eng = []
+    for sc in summary.get("scanners") or []:
+        if isinstance(sc, dict):
+            r = str(sc.get("result") or sc.get("detected_as") or "").strip()
+            if r:
+                eng.append(f"{sc.get('name') or sc.get('engine')}: {r}")
+    root = outcome.full_report
+    fr_ok = isinstance(root, dict) and len(root) > 2
+    return [
+        ("Malware family (vx_family)", str(summary.get("vx_family") or "—")),
+        ("Verdict", str(summary.get("verdict") or "—")),
+        ("Threat score", f"{summary.get('threat_score') or 0}/100"),
+        ("Threat level", str(summary.get("threat_level") or "—")),
+        ("Classification tags", ", ".join(str(t) for t in tags) or "—"),
+        ("Inferred categories (keyword scan on tags, family, AV, signatures)", ", ".join(matched) or "no keyword hits"),
+        ("AV labels (first 12 engines)", "; ".join(eng[:12]) or "—"),
+        ("Signature rows (digest)", str(len(getattr(digest, "signature_rows", []) or []))),
+        ("MITRE rows (digest)", str(len(getattr(digest, "mitre_rows", []) or []))),
+        ("Full JSON report loaded", "yes" if fr_ok else "no / empty / API denied"),
+    ]
 
 
 class _HADocTemplate(SimpleDocTemplate):
@@ -50,6 +108,7 @@ def build_analysis_pdf(
     screenshots = sup.get("screenshot_images") if isinstance(sup.get("screenshot_images"), list) else []
     pcap_summary = sup.get("pcap_summary") if isinstance(sup.get("pcap_summary"), dict) else {}
     digest = build_forensic_digest(outcome.full_report, summary, sup, outcome.milestones)
+    cfg = Settings()
 
     styles = getSampleStyleSheet()
     h1 = ParagraphStyle("HA_H1", parent=styles["Heading1"], textColor=colors.HexColor("#005f73"))
@@ -81,6 +140,22 @@ def build_analysis_pdf(
     story.append(Paragraph(f"<b>Report ID:</b> {_esc(outcome.job_id or 'No activity observed — field not returned by API')}", body))
     story.append(Paragraph(f"<font color='{verdict_color}'><b>Verdict:</b> {_esc(verdict)}</font>", body))
     story.append(Paragraph(f"<b>Threat Score:</b> {_esc(score)}/100", body))
+    story.append(Spacer(1, 0.12 * inch))
+    cls_rows = _malware_classification_matrix(summary, digest, outcome)
+    cls_tbl = Table(
+        [[Paragraph(f"<b>{_esc(a)}</b>", body), Paragraph(_esc(b), mono)] for a, b in cls_rows],
+        colWidths=[1.85 * inch, 4.25 * inch],
+    )
+    cls_tbl.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#78909c")),
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#e0f7fa")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]
+        )
+    )
+    story.append(cls_tbl)
     story.append(PageBreak())
 
     # Real TOC (filled after full layout)
@@ -90,28 +165,31 @@ def build_analysis_pdf(
     story.append(toc)
     story.append(PageBreak())
 
-    # Executive summary
+    # Executive summary + API-derived narrative (matches analyzer panel)
     tags = summary.get("classification_tags") if isinstance(summary.get("classification_tags"), list) else []
     story.append(Paragraph("Executive Summary", h1))
     story.append(
         Paragraph(
             _esc(
                 f"Verdict {verdict}, score {score}/100, family {family}. "
-                f"Tags ({len(tags)}): {', '.join(str(x) for x in tags[:24]) or 'none'}. "
-                f"Processes API: {len(processes)}; digest process rows: {len(digest.process_rows)}; "
-                f"file rows: {len(digest.file_activity_rows)}; registry rows: {len(digest.registry_rows)}; "
-                f"signatures: {len(digest.signature_rows)}; MITRE rows: {len(digest.mitre_rows)}; "
-                f"DNS (summary): {len(summary.get('dns_requests') or []) if isinstance(summary.get('dns_requests'), list) else 0}, "
-                f"DNS (full-report extract): {len(digest.network_dns_rows)}; "
+                f"Tags ({len(tags)}): {', '.join(str(x) for x in tags[:40]) or 'none'}. "
+                f"Processes (API): {len(processes)}; processes (digest): {len(digest.process_rows)}; "
+                f"files (digest): {len(digest.file_activity_rows)}; registry (digest): {len(digest.registry_rows)}; "
+                f"signatures: {len(digest.signature_rows)}; MITRE: {len(digest.mitre_rows)}; "
+                f"DNS (summary): {len(summary.get('dns_requests') or []) if isinstance(summary.get('dns_requests'), list) else 0}; "
+                f"DNS (network digest): {len(digest.network_dns_rows)}; "
                 f"streams: {len(summary.get('network_streams') or []) if isinstance(summary.get('network_streams'), list) else 0}."
             ),
             body,
         )
     )
-    story.append(PageBreak())
-
-    # Malware classification signals (API-derived only)
-    story.append(Paragraph("Malware Classification Signals", h1))
+    story.append(Paragraph("<b>Behavior summary (API-derived)</b>", h2))
+    story.append(Paragraph(_esc(outcome.behavior_summary or "—"), body))
+    story.append(Paragraph("<b>Key findings</b>", h2))
+    for line in outcome.key_findings or ["—"]:
+        story.append(Paragraph(_esc(f"• {line}"), body))
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(Paragraph("Classification detail (API fields)", h2))
     signals = _extract_classification_signals(summary, outcome.full_report)
     story.append(_data_table(["Signal Type", "Value"], [[k, v] for k, v in signals], [1.8 * inch, 4.3 * inch], body, mono))
     story.append(PageBreak())
@@ -216,12 +294,19 @@ def build_analysis_pdf(
 
     # Process behavior
     story.append(Paragraph("Process Behavior", h1))
-    process_rows_for_pdf = processes
+    process_rows_for_pdf: list[Any] = list(processes) if processes else []
     if not process_rows_for_pdf and digest.process_rows:
         process_rows_for_pdf = [
             {"pid": r[0], "parentpid": r[1], "name": r[2], "normalized_path": r[2], "cmdline": r[3]}
             for r in digest.process_rows
         ]
+        story.append(
+            Paragraph(
+                "Process endpoint returned no list; rows below are merged from job summary and full-report digest (same sources as the web UI).",
+                small,
+            )
+        )
+        story.append(Spacer(1, 0.06 * inch))
     if process_rows_for_pdf:
         p_rows = []
         by_pid: dict[str, dict[str, Any]] = {}
@@ -284,7 +369,12 @@ def build_analysis_pdf(
         story.append(Paragraph("Mutexes Created", h2))
         story.extend(_chunked_tables(["PID", "Mutex"], m_rows, [0.7 * inch, 5.4 * inch], body, mono))
     else:
-        story.append(Paragraph("No activity observed — processes endpoint returned empty payload.", body))
+        story.append(
+            Paragraph(
+                "No process rows after merging API processes, summary, and digest. If the web UI shows a tree, check API key privileges for /processes and /report/json.",
+                body,
+            )
+        )
     story.append(PageBreak())
 
     # Behavioral analysis sync block (full report + supplemental)
@@ -514,7 +604,7 @@ def build_analysis_pdf(
         story.append(_data_table(["#", "Name/Slot", "Reference"], shot_index_rows, [0.5 * inch, 1.8 * inch, 3.8 * inch], body, mono))
         story.append(Spacer(1, 0.08 * inch))
     if screenshots:
-        for i, shot in enumerate(screenshots, start=1):
+        for i, shot in enumerate(screenshots[: cfg.max_embedded_screenshots], start=1):
             if not isinstance(shot, dict):
                 continue
             blob = shot.get("bytes")
@@ -622,7 +712,11 @@ def build_ioc_summary(summary: dict[str, Any], processes: list[Any], dropped: li
             continue
         for key in ("registry_keys_set", "registry_keys_deleted"):
             if isinstance(p.get(key), list):
-                regkeys.extend(str(x) for x in p.get(key))
+                for x in p.get(key):
+                    if isinstance(x, dict):
+                        regkeys.append(str(x.get("key") or x.get("path") or x.get("name") or x))
+                    else:
+                        regkeys.append(str(x))
         for key in ("created_files", "deleted_files"):
             if isinstance(p.get(key), list):
                 filepaths.extend(str(x) for x in p.get(key))

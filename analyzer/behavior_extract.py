@@ -88,6 +88,12 @@ def extract_from_ha_report(full_report: dict[str, Any] | list[Any], summary: dic
         line = p.get("path") or p.get("name") or p.get("process_name")
         if line:
             prof.processes.append(str(line))
+    for p in _as_list(summary.get("processes")):
+        if not isinstance(p, dict):
+            continue
+        line = p.get("path") or p.get("name") or p.get("process_name") or p.get("normalized_path")
+        if line:
+            prof.processes.append(str(line))
 
     # Network
     net = root.get("network") or beh_d.get("network")
