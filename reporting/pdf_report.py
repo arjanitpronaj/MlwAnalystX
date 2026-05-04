@@ -216,21 +216,22 @@ def _append_sandbox_execution_section(
     story.append(Paragraph("Sandbox execution — what this sample did", h1))
     story.append(
         Paragraph(
-            "Concrete telemetry from Hybrid Analysis (Falcon Sandbox) APIs: processes, full paths, registry keys, "
-            "and sandbox desktop screenshots. Data is merged from <b>/processes</b>, job <b>summary</b>, "
-            "<b>/screenshots</b>, and full-report digest when JSON is available.",
+            "Falcon Sandbox <b>guest VM</b> telemetry: processes, full paths, registry, network, and "
+            "<b>desktop screenshots</b> — the same captures shown on <b>https://www.hybrid-analysis.com/</b> "
+            "in the report (sandbox desktop during execution). Sources: <b>/processes</b>, <b>/screenshots</b>, "
+            "job <b>summary</b> (if it carries screenshot metadata), and full-report digest when JSON is available.",
             body,
         )
     )
     story.append(Spacer(1, 0.06 * inch))
 
     raw_sh = sup.get("screenshots")
-    story.append(Paragraph("1. Sandbox screenshots (Hybrid Analysis)", h2))
+    story.append(Paragraph("1. VM desktop screenshots (Falcon Sandbox guest)", h2))
     story.append(
         Paragraph(
             _esc(
-                f"Decoded raster images embedded below: {len(screenshots)}. "
-                f"Raw /screenshots JSON type: {type(raw_sh).__name__}."
+                f"Embedded VM desktop frame(s): {len(screenshots)}. "
+                f"Merged /screenshots (+ summary) JSON type: {type(raw_sh).__name__}."
             ),
             small,
         )
@@ -260,8 +261,8 @@ def _append_sandbox_execution_section(
     else:
         story.append(
             Paragraph(
-                "No PNG/JPEG/GIF/WEBP/BMP decoded from the screenshots payload. Check the redacted JSON above; "
-                "your API key must allow GET /report/{job}/screenshots (default privilege).",
+                "No VM desktop image bytes decoded from the API payload (same gallery as the HA web report). "
+                "See redacted JSON above; key must allow GET /report/{job}/screenshots and JSON fields image/thumbnail.",
                 body,
             )
         )

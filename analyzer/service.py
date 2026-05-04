@@ -250,7 +250,12 @@ class AnalysisService:
             except HybridAnalysisError as exc:
                 log(f"⚠ screenshots via SHA: {exc}")
             job_sh = client.get_json_optional(f"/report/{job_id}/screenshots")
-            supplemental["screenshots"] = merge_screenshot_json_payloads(sha_sh, job_sh)
+            merged_sh = merge_screenshot_json_payloads(sha_sh, job_sh)
+            # Some summary payloads include screenshot metadata (same VM desktop gallery as the web UI).
+            sum_sh = summary.get("screenshots")
+            if sum_sh is not None:
+                merged_sh = merge_screenshot_json_payloads(merged_sh, sum_sh)
+            supplemental["screenshots"] = merged_sh
             supplemental["memory_dumps"] = safe_json("memory-dumps", lambda: client.get_report_memory_dumps(report_sha256), f"/report/{job_id}/memory-dumps")
             supplemental["strings"] = safe_json("strings", lambda: client.get_report_strings(report_sha256), f"/report/{job_id}/strings")
             supplemental["pcap"] = safe_bin("pcap", lambda: client.get_report_pcap(report_sha256), f"/report/{job_id}/pcap")
