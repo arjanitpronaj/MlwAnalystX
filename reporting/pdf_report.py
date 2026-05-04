@@ -18,6 +18,26 @@ from config.defaults import Settings
 from reporting.forensic_digest import build_forensic_digest
 
 
+def _redact_nested_blobs(obj: Any, *, max_str: int = 120, depth: int = 0) -> Any:
+    """Shrink huge base64 / binary strings for PDF JSON blocks."""
+    if depth > 14:
+        return "<max depth>"
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            lk = str(k).lower()
+            if lk in ("image", "picture", "data", "content", "screenshot_data") and isinstance(v, str) and len(v) > max_str:
+                out[k] = f"<elided {len(v)} chars>"
+            else:
+                out[k] = _redact_nested_blobs(v, max_str=max_str, depth=depth + 1)
+        return out
+    if isinstance(obj, list):
+        return [_redact_nested_blobs(x, max_str=max_str, depth=depth + 1) for x in obj[:120]]
+    if isinstance(obj, str) and len(obj) > 600:
+        return obj[:max_str] + f"…<{len(obj)} chars total>"
+    return obj
+
+
 def _malware_classification_matrix(
     summary: dict[str, Any],
     digest: Any,
@@ -599,6 +619,17 @@ def build_analysis_pdf(
 
     # Execution screenshots
     story.append(Paragraph("Execution Screenshots", h1))
+    raw_sh = sup.get("screenshots")
+    story.append(
+        Paragraph(
+            _esc(
+                f"API screenshot JSON: type={type(raw_sh).__name__}; "
+                f"embedded decodes for PDF: {len(screenshots)} image(s)."
+            ),
+            small,
+        )
+    )
+    story.extend(_json_block("Screenshots API (redacted, large fields elided)", _redact_nested_blobs(raw_sh), mono, body, max_lines=400))
     shot_index_rows = digest.screenshot_index
     if shot_index_rows:
         story.append(_data_table(["#", "Name/Slot", "Reference"], shot_index_rows, [0.5 * inch, 1.8 * inch, 3.8 * inch], body, mono))
@@ -616,15 +647,19 @@ def build_analysis_pdf(
                 img = Image(BytesIO(bytes(blob)))
                 img._restrictSize(6.1 * inch, 8.5 * inch)
                 story.append(img)
-            except (OSError, ValueError):
-                story.append(Paragraph("No activity observed — screenshot bytes could not be decoded.", body))
-            story.append(Paragraph("Caption: Screenshot captured by Hybrid Analysis sandbox execution timeline.", small))
-            story.append(Spacer(1, 0.1 * inch))
+            except (OSError, ValueError) as exc:
+                story.append(Paragraph(_esc(f"Image decode failed ({type(exc).__name__}); raw size {len(bytes(blob))} bytes."), body))
+            story.append(Spacer(1, 0.06 * inch))
     else:
         if shot_index_rows:
-            story.append(Paragraph("Screenshot list/metadata present; binary GET returned no decodable image (check API key tier and paths).", body))
+            story.append(
+                Paragraph(
+                    "Screenshot metadata rows exist but no PNG/JPEG/GIF/WEBP/BMP bytes were produced. See redacted JSON block above for API payload shape.",
+                    body,
+                )
+            )
         else:
-            story.append(Paragraph("No screenshot entries in API response for this job.", body))
+            story.append(Paragraph("Screenshots endpoint returned no list/metadata for this job.", body))
     story.append(PageBreak())
 
     # Threat classification

@@ -659,14 +659,7 @@ def build_forensic_digest(
     digest.appendix_telemetry_lines = _appendix_lines(root, summary)
 
     digest.exec_flow_narrative = [
-        "This section reconstructs the analytical workflow from the operator workstation through the Falcon Sandbox.",
-        "Step 1 — Sample was hashed locally and transmitted only via the Hybrid Analysis API (no local execution on this host).",
-        "Step 2 — The submission was accepted and assigned a job identifier for asynchronous sandbox execution.",
-        "Step 3 — The remote environment executed the specimen while kernel and user-mode monitors recorded behavioral telemetry.",
-        "Step 4 — Telemetry was aggregated into the JSON report, summary verdicts, and optional supplemental artifacts.",
-        "Step 5 — MlwAnalystX normalized the payload into the tables in this document for analyst review.",
-        "",
-        "Client-side milestone log:",
+        "Client-side milestone log (technical):",
     ]
     for sec, label in milestones[:80]:
         digest.exec_flow_narrative.append(f"  T+{sec:8.2f}s — {label}")
