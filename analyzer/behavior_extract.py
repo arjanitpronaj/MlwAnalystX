@@ -4,19 +4,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-
-SUSPICIOUS_TLDS = re.compile(
-    r"\.(tk|ml|ga|cf|gq|xyz|top|click|download|loan|zip|review|buzz|icu|cfd|bar|cyou|quest|autos|beauty|hair|skin|makeup|boats|homes|motorcycles|sbs|rest|cfd)$",
-    re.I,
-)
-
-
-@dataclass
-class BehavioralProfile:
-    created_files: list[str] = field(default_factory=list)
-    persistence_indicators: list[str] = field(default_factory=list)
-    processes: list[str] = field(default_factory=list)
-    process_chains: list[str] = field(default_factory=list)
     ips: list[str] = field(default_factory=list)
     domains: list[str] = field(default_factory=list)
     dns_calls: list[str] = field(default_factory=list)
