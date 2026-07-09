@@ -18,5 +18,5 @@ class Settings:
     max_upload_bytes: int = 100 * 1024 * 1024
     default_environment_id: int = 120
     post_success_settle_sec: float = 20.0
-    max_embedded_screenshots: int = 8
+    max_embedded_screenshots: int = 24
     max_screenshot_bytes: int = 8 * 1024 * 1024

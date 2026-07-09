@@ -4,7 +4,6 @@ import gzip
 import json
 import time
 from collections.abc import Callable
-from urllib.parse import urlparse
 from typing import Any
 
 import requests
@@ -58,8 +57,12 @@ class HybridAnalysisClient:
         data: dict[str, Any] | None = None,
         files: dict[str, Any] | None = None,
         stream: bool = False,
+        headers: dict[str, str] | None = None,
     ) -> requests.Response:
-        url = f"{self._settings.api_base_url.rstrip('/')}{path}"
+        if path.startswith("http://") or path.startswith("https://"):
+            url = path
+        else:
+            url = f"{self._settings.api_base_url.rstrip('/')}{path}"
         timeout = (self._settings.connect_timeout_sec, self._settings.read_timeout_sec)
         attempt = 0
         last_exc: Exception | None = None
@@ -70,6 +73,7 @@ class HybridAnalysisClient:
             try:
                 if files:
                     self._rewind_files(files)
+                req_headers = dict(headers) if headers else None
                 resp = self._session.request(
                     method,
                     url,
@@ -78,6 +82,7 @@ class HybridAnalysisClient:
                     files=files,
                     timeout=timeout,
                     stream=stream,
+                    headers=req_headers,
                 )
             except requests.RequestException as exc:
                 last_exc = exc
@@ -230,13 +235,16 @@ class HybridAnalysisClient:
         GET binary payload and return bytes.
         Returns None when unavailable, non-200, or larger than max_bytes.
         """
-        parsed = urlparse(path_or_url)
-        path = parsed.path if parsed.scheme and parsed.netloc else path_or_url
-        resp = self._request("GET", path)
+        path = path_or_url
+        # Session default Accept: application/json breaks image/binary endpoints.
+        bin_headers = {"Accept": "*/*", "Accept-Encoding": "identity"}
+        resp = self._request("GET", path, headers=bin_headers)
         if resp.status_code != 200:
             return None
         blob = resp.content
         if not blob or len(blob) > max_bytes:
+            return None
+        if blob[:1] in (b"{", b"[") and b"image" not in (resp.headers.get("Content-Type") or "").lower():
             return None
         return blob
 

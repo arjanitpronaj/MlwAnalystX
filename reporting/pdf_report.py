@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 from io import BytesIO
 from pathlib import Path
@@ -13,6 +14,369 @@ from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, S
 from reportlab.platypus.tableofcontents import TableOfContents
 
 from analyzer.service import AnalysisOutcome
+from config.defaults import Settings
+from reporting.forensic_digest import build_forensic_digest
+
+
+def _redact_nested_blobs(obj: Any, *, max_str: int = 120, depth: int = 0) -> Any:
+    """Shrink huge base64 / binary strings for PDF JSON blocks."""
+    if depth > 14:
+        return "<max depth>"
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            lk = str(k).lower()
+            if lk in ("image", "picture", "data", "content", "screenshot_data") and isinstance(v, str) and len(v) > max_str:
+                out[k] = f"<elided {len(v)} chars>"
+            else:
+                out[k] = _redact_nested_blobs(v, max_str=max_str, depth=depth + 1)
+        return out
+    if isinstance(obj, list):
+        return [_redact_nested_blobs(x, max_str=max_str, depth=depth + 1) for x in obj[:120]]
+    if isinstance(obj, str) and len(obj) > 600:
+        return obj[:max_str] + f"…<{len(obj)} chars total>"
+    return obj
+
+
+def _resolve_process_list(processes: list[Any], digest: Any) -> list[Any]:
+    procs: list[Any] = list(processes) if processes else []
+    if not procs and getattr(digest, "process_rows", None):
+        procs = [
+            {"pid": r[0], "parentpid": r[1], "name": r[2], "normalized_path": r[2], "cmdline": r[3]}
+            for r in digest.process_rows
+        ]
+    return procs
+
+
+def _collect_proc_fs_reg_mutex(
+    process_rows_for_pdf: list[Any],
+) -> tuple[list[list[str]], list[list[str]], list[list[str]], list[list[str]], dict[str, dict[str, Any]], dict[str, list[str]]]:
+    p_rows: list[list[str]] = []
+    f_rows: list[list[str]] = []
+    r_rows: list[list[str]] = []
+    m_rows: list[list[str]] = []
+    by_pid: dict[str, dict[str, Any]] = {}
+    children: dict[str, list[str]] = {}
+    for p in process_rows_for_pdf:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("pid") or "")
+        ppid = str(p.get("parentpid") or p.get("ppid") or "")
+        by_pid[pid] = p
+        children.setdefault(ppid, []).append(pid)
+        p_rows.append(
+            [
+                pid,
+                ppid,
+                str(p.get("name") or ""),
+                str(p.get("normalized_path") or p.get("path") or ""),
+                str(p.get("cmdline") or p.get("command_line") or ""),
+            ]
+        )
+        for key, action in (("created_files", "created"), ("deleted_files", "deleted"), ("modified_files", "modified")):
+            if isinstance(p.get(key), list):
+                for fp in p.get(key):
+                    f_rows.append([pid, action, str(fp)])
+        for key, action in (("registry_keys_set", "set"), ("registry_keys_deleted", "delete")):
+            if isinstance(p.get(key), list):
+                for rk in p.get(key):
+                    if isinstance(rk, dict):
+                        r_rows.append([pid, action, str(rk.get("key") or rk.get("path") or rk.get("name") or rk)])
+                    else:
+                        r_rows.append([pid, action, str(rk)])
+        if isinstance(p.get("mutants"), list):
+            for mt in p.get("mutants"):
+                m_rows.append([pid, str(mt)])
+    return f_rows, r_rows, m_rows, p_rows, by_pid, children
+
+
+def _merge_file_paths_unique(f_rows: list[list[str]], digest: Any) -> list[list[str]]:
+    seen: set[str] = set()
+    out: list[list[str]] = []
+    for row in f_rows:
+        path = row[2] if len(row) > 2 else ""
+        key = f"{row[1]}|{path}".lower()
+        if path and key not in seen:
+            seen.add(key)
+            out.append([row[0], row[1], path])
+    for r in getattr(digest, "file_activity_rows", []) or []:
+        if len(r) < 2:
+            continue
+        act, path = r[0], r[1]
+        src = r[3] if len(r) > 3 else "report"
+        det = r[2] if len(r) > 2 else ""
+        key = f"{act}|{path}".lower()
+        if path and key not in seen:
+            seen.add(key)
+            out.append([src, act, path + (f"  ({det})" if det else "")])
+    return out
+
+
+def _merge_registry_unique(r_rows: list[list[str]], digest: Any) -> list[list[str]]:
+    seen: set[str] = set()
+    out: list[list[str]] = []
+    for row in r_rows:
+        if len(row) < 3:
+            continue
+        pid, act, key = row[0], row[1], row[2]
+        k = f"{act}|{key}".lower()
+        if key and k not in seen:
+            seen.add(k)
+            out.append([pid, act, key, ""])
+    for row in getattr(digest, "registry_rows", []) or []:
+        if len(row) < 2:
+            continue
+        act, key, val = row[0], row[1], row[2] if len(row) > 2 else ""
+        kk = f"{act}|{key}".lower()
+        if key and kk not in seen:
+            seen.add(kk)
+            out.append(["report", act, key, val])
+    return out
+
+
+def _append_sandbox_network_compact(
+    story: list[Any],
+    summary: dict[str, Any],
+    h2: ParagraphStyle,
+    body: ParagraphStyle,
+    mono: ParagraphStyle,
+) -> None:
+    dns_rows: list[list[str]] = []
+    dns = summary.get("dns_requests") if isinstance(summary.get("dns_requests"), list) else []
+    for d in dns:
+        if isinstance(d, dict):
+            dns_rows.append(
+                [
+                    str(d.get("domain") or d.get("host") or d),
+                    str(d.get("ip") or d.get("resolved_ip") or ""),
+                    str(d.get("timestamp") or d.get("time") or ""),
+                ]
+            )
+        else:
+            dns_rows.append([str(d), "", ""])
+    story.append(Paragraph("Network — DNS (from job summary API)", h2))
+    story.extend(_chunked_tables(["Domain", "Resolved IP", "Time"], dns_rows, [2.6 * inch, 1.6 * inch, 1.9 * inch], body, mono))
+
+    http_rows: list[list[str]] = []
+    http = summary.get("http_requests") if isinstance(summary.get("http_requests"), list) else []
+    for h in http:
+        if isinstance(h, dict):
+            http_rows.append(
+                [
+                    str(h.get("method") or ""),
+                    str(h.get("url") or h.get("uri") or ""),
+                    str(h.get("response_code") or h.get("status") or ""),
+                    str(h.get("timestamp") or h.get("time") or ""),
+                ]
+            )
+        else:
+            http_rows.append(["", str(h), "", ""])
+    story.append(Spacer(1, 0.06 * inch))
+    story.append(Paragraph("Network — HTTP (from job summary API)", h2))
+    story.extend(_chunked_tables(["Method", "URL", "Response", "Time"], http_rows, [0.6 * inch, 3.5 * inch, 0.6 * inch, 1.4 * inch], body, mono))
+
+    conn_rows: list[list[str]] = []
+    conns = summary.get("network_streams") if isinstance(summary.get("network_streams"), list) else []
+    for c in conns:
+        if isinstance(c, dict):
+            src = f"{c.get('src_ip') or c.get('source_ip') or ''}:{c.get('src_port') or ''}"
+            dst = f"{c.get('dst_ip') or c.get('destination_ip') or ''}:{c.get('dst_port') or ''}"
+            conn_rows.append([src, dst, str(c.get("protocol") or c.get("transport") or ""), str(c.get("bytes_sent") or ""), str(c.get("bytes_received") or "")])
+        else:
+            conn_rows.append(["", str(c), "", "", ""])
+    story.append(Spacer(1, 0.06 * inch))
+    story.append(Paragraph("Network — connections (from job summary API)", h2))
+    story.extend(
+        _chunked_tables(
+            ["Source", "Destination", "Protocol", "Bytes sent", "Bytes recv"],
+            conn_rows,
+            [1.45 * inch, 1.55 * inch, 0.8 * inch, 1.0 * inch, 1.2 * inch],
+            body,
+            mono,
+        )
+    )
+
+
+def _append_sandbox_execution_section(
+    story: list[Any],
+    *,
+    proc_list: list[Any],
+    digest: Any,
+    summary: dict[str, Any],
+    sup: dict[str, Any],
+    screenshots: list[Any],
+    cfg: Settings,
+    h1: ParagraphStyle,
+    h2: ParagraphStyle,
+    body: ParagraphStyle,
+    mono: ParagraphStyle,
+    small: ParagraphStyle,
+) -> None:
+    """Primary analyst section: screenshots, processes, paths, registry, network."""
+    story.append(Paragraph("Sandbox execution — what this sample did", h1))
+    story.append(
+        Paragraph(
+            "Falcon Sandbox <b>guest VM</b> telemetry: processes, full paths, registry, network, and "
+            "<b>desktop screenshots</b> — the same captures shown on <b>https://www.hybrid-analysis.com/</b> "
+            "in the report (sandbox desktop during execution). Sources: <b>/processes</b>, <b>/screenshots</b>, "
+            "job <b>summary</b> (if it carries screenshot metadata), and full-report digest when JSON is available.",
+            body,
+        )
+    )
+    story.append(Spacer(1, 0.06 * inch))
+
+    raw_sh = sup.get("screenshots")
+    story.append(Paragraph("1. VM desktop screenshots (Falcon Sandbox guest)", h2))
+    story.append(
+        Paragraph(
+            _esc(
+                f"Embedded VM desktop frame(s): {len(screenshots)}. "
+                f"Merged /screenshots (+ summary) JSON type: {type(raw_sh).__name__}."
+            ),
+            small,
+        )
+    )
+    story.extend(_json_block("Screenshots API (redacted)", _redact_nested_blobs(raw_sh), mono, body, max_lines=350))
+    shot_index_rows = digest.screenshot_index if hasattr(digest, "screenshot_index") else []
+    if shot_index_rows:
+        story.append(_data_table(["#", "Name", "Reference / note"], shot_index_rows, [0.45 * inch, 1.5 * inch, 4.15 * inch], body, mono))
+        story.append(Spacer(1, 0.06 * inch))
+    if screenshots:
+        for i, shot in enumerate(screenshots[: cfg.max_embedded_screenshots], start=1):
+            if not isinstance(shot, dict):
+                continue
+            blob = shot.get("bytes")
+            if not isinstance(blob, (bytes, bytearray)):
+                continue
+            ts = shot.get("timestamp") or shot.get("time") or "—"
+            nm = shot.get("name") or f"shot_{i}"
+            story.append(Paragraph(_esc(f"Screenshot {i}: {nm} — {ts}"), h2))
+            try:
+                img = Image(BytesIO(bytes(blob)))
+                img._restrictSize(6.2 * inch, 8.2 * inch)
+                story.append(img)
+            except (OSError, ValueError) as exc:
+                story.append(Paragraph(_esc(f"Decode error: {type(exc).__name__}, {len(bytes(blob))} bytes."), body))
+            story.append(Spacer(1, 0.05 * inch))
+    else:
+        story.append(
+            Paragraph(
+                "No VM desktop image bytes decoded from the API payload (same gallery as the HA web report). "
+                "See redacted JSON above; key must allow GET /report/{job}/screenshots and JSON fields image/thumbnail.",
+                body,
+            )
+        )
+    story.append(Spacer(1, 0.08 * inch))
+
+    story.append(Paragraph("2. Processes (PID, parent, image path, command line)", h2))
+    if not proc_list:
+        story.append(Paragraph("No process list from /processes or summary/digest merge.", body))
+    else:
+        f_rows, r_rows, m_rows, p_rows, by_pid, children = _collect_proc_fs_reg_mutex(proc_list)
+        story.append(Paragraph("Process tree (parent → child)", body))
+        for line in _process_tree_lines(by_pid, children):
+            story.append(Paragraph(_esc(line), mono))
+        story.append(Spacer(1, 0.06 * inch))
+        story.extend(
+            _chunked_tables(
+                ["PID", "Parent PID", "Process name", "Image path", "Command line"],
+                p_rows,
+                [0.48 * inch, 0.55 * inch, 0.95 * inch, 1.85 * inch, 2.27 * inch],
+                body,
+                mono,
+            )
+        )
+
+        story.append(Spacer(1, 0.08 * inch))
+        story.append(Paragraph("3. File system — created / modified / deleted (full paths)", h2))
+        merged_files = _merge_file_paths_unique(f_rows, digest)
+        story.extend(
+            _chunked_tables(
+                ["Source (PID or report)", "Action", "Path"],
+                [[a[0], a[1], a[2]] for a in merged_files],
+                [1.1 * inch, 0.75 * inch, 4.25 * inch],
+                body,
+                mono,
+            )
+        )
+
+        story.append(Spacer(1, 0.08 * inch))
+        story.append(Paragraph("4. Registry — keys set or deleted (per process + report digest)", h2))
+        merged_reg = _merge_registry_unique(r_rows, digest)
+        story.extend(
+            _chunked_tables(
+                ["Source (PID/report)", "Action", "Registry key", "Value / detail"],
+                merged_reg,
+                [0.85 * inch, 0.55 * inch, 2.85 * inch, 1.85 * inch],
+                body,
+                mono,
+            )
+        )
+
+        story.append(Spacer(1, 0.08 * inch))
+        story.append(Paragraph("5. Mutexes (per process)", h2))
+        story.extend(_chunked_tables(["PID", "Mutex name"], m_rows, [0.75 * inch, 5.35 * inch], body, mono))
+
+    story.append(Spacer(1, 0.08 * inch))
+    _append_sandbox_network_compact(story, summary, h2, body, mono)
+    story.append(PageBreak())
+
+
+def _malware_classification_matrix(
+    summary: dict[str, Any],
+    digest: Any,
+    outcome: AnalysisOutcome,
+) -> list[tuple[str, str]]:
+    tags = summary.get("classification_tags") if isinstance(summary.get("classification_tags"), list) else []
+    blob = " ".join(str(t) for t in tags).lower()
+    blob += " " + str(summary.get("vx_family") or "").lower()
+    blob += " " + str(summary.get("verdict") or "").lower()
+    for sc in summary.get("scanners") or []:
+        if isinstance(sc, dict):
+            blob += " " + str(sc.get("result") or sc.get("detected_as") or "").lower()
+    for row in getattr(digest, "signature_rows", []) or []:
+        for cell in row:
+            blob += " " + str(cell).lower()
+    hits = (
+        "ransomware",
+        "ransom",
+        "trojan",
+        "worm",
+        "stealer",
+        "dropper",
+        "loader",
+        "keylog",
+        "spyware",
+        "banker",
+        "miner",
+        "botnet",
+        "backdoor",
+        "wiper",
+        "locker",
+        "cryptor",
+        "rootkit",
+    )
+    matched = sorted({h for h in hits if h in blob})
+    eng = []
+    for sc in summary.get("scanners") or []:
+        if isinstance(sc, dict):
+            r = str(sc.get("result") or sc.get("detected_as") or "").strip()
+            if r:
+                eng.append(f"{sc.get('name') or sc.get('engine')}: {r}")
+    root = outcome.full_report
+    fr_ok = isinstance(root, dict) and len(root) > 2
+    return [
+        ("Malware family (vx_family)", str(summary.get("vx_family") or "—")),
+        ("Verdict", str(summary.get("verdict") or "—")),
+        ("Threat score", f"{summary.get('threat_score') or 0}/100"),
+        ("Threat level", str(summary.get("threat_level") or "—")),
+        ("Classification tags", ", ".join(str(t) for t in tags) or "—"),
+        ("Inferred categories (keyword scan on tags, family, AV, signatures)", ", ".join(matched) or "no keyword hits"),
+        ("AV labels (first 12 engines)", "; ".join(eng[:12]) or "—"),
+        ("Signature rows (digest)", str(len(getattr(digest, "signature_rows", []) or []))),
+        ("MITRE rows (digest)", str(len(getattr(digest, "mitre_rows", []) or []))),
+        ("Full JSON report loaded", "yes" if fr_ok else "no / empty / API denied"),
+    ]
 
 
 class _HADocTemplate(SimpleDocTemplate):
@@ -40,13 +404,16 @@ def build_analysis_pdf(
     dest_path: Path,
 ) -> Path:
     sup = outcome.supplemental or {}
-    summary = (sup.get("summary_by_sha") or outcome.summary or {}) if isinstance((sup.get("summary_by_sha") or outcome.summary or {}), dict) else {}
+    summary = outcome.summary if isinstance(outcome.summary, dict) else {}
     processes = sup.get("processes") if isinstance(sup.get("processes"), list) else []
     dropped = sup.get("dropped_files") if isinstance(sup.get("dropped_files"), list) else []
     strings = sup.get("strings") if isinstance(sup.get("strings"), list) else []
     memory_dumps = sup.get("memory_dumps")
     screenshots = sup.get("screenshot_images") if isinstance(sup.get("screenshot_images"), list) else []
     pcap_summary = sup.get("pcap_summary") if isinstance(sup.get("pcap_summary"), dict) else {}
+    digest = build_forensic_digest(outcome.full_report, summary, sup, outcome.milestones)
+    cfg = Settings()
+    proc_list = _resolve_process_list(processes, digest)
 
     styles = getSampleStyleSheet()
     h1 = ParagraphStyle("HA_H1", parent=styles["Heading1"], textColor=colors.HexColor("#005f73"))
@@ -73,11 +440,27 @@ def build_analysis_pdf(
     story.append(Spacer(1, 0.15 * inch))
     story.append(Paragraph(f"<b>File Name:</b> {_esc(summary.get('submit_name') or source_file.name)}", body))
     story.append(Paragraph(f"<b>SHA256:</b> {_esc(summary.get('sha256') or sha256)}", mono))
-    story.append(Paragraph(f"<b>Analysis Date:</b> {_esc(summary.get('analysis_start_time') or 'No activity observed — field not returned by API')}", body))
-    story.append(Paragraph(f"<b>Environment:</b> {_esc(summary.get('environment_description') or 'No activity observed — field not returned by API')}", body))
-    story.append(Paragraph(f"<b>Report ID:</b> {_esc(outcome.job_id or 'No activity observed — field not returned by API')}", body))
+    story.append(Paragraph(f"<b>Analysis Date:</b> {_esc(summary.get('analysis_start_time') or '—')}", body))
+    story.append(Paragraph(f"<b>Environment:</b> {_esc(summary.get('environment_description') or '—')}", body))
+    story.append(Paragraph(f"<b>Report ID (job_id):</b> {_esc(outcome.job_id or '—')}", body))
     story.append(Paragraph(f"<font color='{verdict_color}'><b>Verdict:</b> {_esc(verdict)}</font>", body))
     story.append(Paragraph(f"<b>Threat Score:</b> {_esc(score)}/100", body))
+    story.append(Spacer(1, 0.12 * inch))
+    cls_rows = _malware_classification_matrix(summary, digest, outcome)
+    cls_tbl = Table(
+        [[Paragraph(f"<b>{_esc(a)}</b>", body), Paragraph(_esc(b), mono)] for a, b in cls_rows],
+        colWidths=[1.85 * inch, 4.25 * inch],
+    )
+    cls_tbl.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#78909c")),
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#e0f7fa")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]
+        )
+    )
+    story.append(cls_tbl)
     story.append(PageBreak())
 
     # Real TOC (filled after full layout)
@@ -87,20 +470,49 @@ def build_analysis_pdf(
     story.append(toc)
     story.append(PageBreak())
 
-    # Executive summary
+    # Executive summary + API-derived narrative (matches analyzer panel)
     tags = summary.get("classification_tags") if isinstance(summary.get("classification_tags"), list) else []
     story.append(Paragraph("Executive Summary", h1))
     story.append(
         Paragraph(
             _esc(
-                f"Hybrid Analysis reports verdict {verdict} with threat score {score}/100 and family {family}. "
-                f"Top tags: {', '.join(str(x) for x in tags[:8]) if tags else 'No activity observed — API returned empty classification_tags'}. "
-                f"Processes: {len(processes)}; network streams: {len(summary.get('network_streams') or []) if isinstance(summary.get('network_streams'), list) else 0}."
+                f"Verdict {verdict}, score {score}/100, family {family}. "
+                f"Tags ({len(tags)}): {', '.join(str(x) for x in tags[:40]) or 'none'}. "
+                f"Processes (API): {len(processes)}; processes (digest): {len(digest.process_rows)}; "
+                f"files (digest): {len(digest.file_activity_rows)}; registry (digest): {len(digest.registry_rows)}; "
+                f"signatures: {len(digest.signature_rows)}; MITRE: {len(digest.mitre_rows)}; "
+                f"DNS (summary): {len(summary.get('dns_requests') or []) if isinstance(summary.get('dns_requests'), list) else 0}; "
+                f"DNS (network digest): {len(digest.network_dns_rows)}; "
+                f"streams: {len(summary.get('network_streams') or []) if isinstance(summary.get('network_streams'), list) else 0}."
             ),
             body,
         )
     )
+    story.append(Paragraph("<b>Behavior summary (API-derived)</b>", h2))
+    story.append(Paragraph(_esc(outcome.behavior_summary or "—"), body))
+    story.append(Paragraph("<b>Key findings</b>", h2))
+    for line in outcome.key_findings or ["—"]:
+        story.append(Paragraph(_esc(f"• {line}"), body))
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(Paragraph("Classification detail (API fields)", h2))
+    signals = _extract_classification_signals(summary, outcome.full_report)
+    story.append(_data_table(["Signal Type", "Value"], [[k, v] for k, v in signals], [1.8 * inch, 4.3 * inch], body, mono))
     story.append(PageBreak())
+
+    _append_sandbox_execution_section(
+        story,
+        proc_list=proc_list,
+        digest=digest,
+        summary=summary,
+        sup=sup,
+        screenshots=screenshots,
+        cfg=cfg,
+        h1=h1,
+        h2=h2,
+        body=body,
+        mono=mono,
+        small=small,
+    )
 
     # File information
     story.append(Paragraph("File Information", h1))
@@ -138,7 +550,7 @@ def build_analysis_pdf(
         story.append(Spacer(1, 0.1 * inch))
         story.append(Paragraph(f"Detected by {detects} out of {len(scanner_rows)} engines", body))
     else:
-        story.append(Paragraph("No activity observed — scanners array not returned by API.", body))
+        story.append(Paragraph("No scanner rows in summary JSON.", body))
     story.append(PageBreak())
 
     # Static analysis
@@ -195,67 +607,70 @@ def build_analysis_pdf(
     story.append(Spacer(1, 0.08 * inch))
 
     story.append(Paragraph("Strings", h2))
-    str_rows = [[str(s)] for s in strings]
-    story.append(_data_table(["String"], str_rows, [6.1 * inch], body, mono))
+    effective_strings = strings if strings else digest.interesting_strings
+    str_rows = [[str(s)] for s in effective_strings]
+    story.extend(_chunked_tables(["String"], str_rows, [6.1 * inch], body, mono))
     story.append(PageBreak())
 
-    # Process behavior
-    story.append(Paragraph("Process Behavior", h1))
-    if processes:
-        p_rows = []
-        by_pid: dict[str, dict[str, Any]] = {}
-        children: dict[str, list[str]] = {}
-        for p in processes:
-            if not isinstance(p, dict):
-                continue
-            pid = str(p.get("pid") or "")
-            ppid = str(p.get("parentpid") or p.get("ppid") or "")
-            by_pid[pid] = p
-            children.setdefault(ppid, []).append(pid)
-            p_rows.append(
-                [
-                    pid,
-                    ppid,
-                    str(p.get("name") or ""),
-                    str(p.get("normalized_path") or p.get("path") or ""),
-                    str(p.get("cmdline") or p.get("command_line") or ""),
-                ]
-            )
-        story.append(Paragraph("Process Tree Diagram", h2))
-        for line in _process_tree_lines(by_pid, children):
-            story.append(Paragraph(_esc(line), mono))
-        story.append(Spacer(1, 0.08 * inch))
-        story.append(Paragraph("Per-Process Detail", h2))
-        story.append(_data_table(["PID", "Parent PID", "Name", "Full Path", "Command Line"], p_rows, [0.5 * inch, 0.7 * inch, 1.0 * inch, 1.8 * inch, 2.0 * inch], body, mono))
-        story.append(Spacer(1, 0.08 * inch))
-        story.append(Paragraph("Files Touched (per process)", h2))
-        f_rows: list[list[str]] = []
-        r_rows: list[list[str]] = []
-        m_rows: list[list[str]] = []
-        for p in processes:
-            if not isinstance(p, dict):
-                continue
-            pid = str(p.get("pid") or "")
-            for key, action in (("created_files", "created"), ("deleted_files", "deleted"), ("modified_files", "modified")):
-                if isinstance(p.get(key), list):
-                    for fp in p.get(key):
-                        f_rows.append([pid, action, str(fp)])
-            for key, action in (("registry_keys_set", "set"), ("registry_keys_deleted", "delete")):
-                if isinstance(p.get(key), list):
-                    for rk in p.get(key):
-                        r_rows.append([pid, action, str(rk)])
-            if isinstance(p.get("mutants"), list):
-                for mt in p.get("mutants"):
-                    m_rows.append([pid, str(mt)])
-        story.append(_data_table(["PID", "Action", "Path"], f_rows, [0.6 * inch, 0.8 * inch, 4.7 * inch], body, mono))
-        story.append(Spacer(1, 0.08 * inch))
-        story.append(Paragraph("Registry Activity (per process)", h2))
-        story.append(_data_table(["PID", "Action", "Registry Key"], r_rows, [0.6 * inch, 0.8 * inch, 4.7 * inch], body, mono))
-        story.append(Spacer(1, 0.08 * inch))
-        story.append(Paragraph("Mutexes Created", h2))
-        story.append(_data_table(["PID", "Mutex"], m_rows, [0.7 * inch, 5.4 * inch], body, mono))
-    else:
-        story.append(Paragraph("No activity observed — processes endpoint returned empty payload.", body))
+    # Process / file / registry / screenshots: see "Sandbox execution — what this sample did" (section after Executive Summary).
+    story.append(Paragraph("Process list (reference)", h1))
+    story.append(
+        Paragraph(
+            "Full process tree, command lines, file create/modify/delete paths, registry changes, mutexes, network tables, "
+            "and Hybrid Analysis screenshots are documented in <b>Sandbox execution — what this sample did</b> above.",
+            body,
+        )
+    )
+    story.append(PageBreak())
+
+    # Additional digest-only telemetry (signatures, MITRE, services, timeline)
+    story.append(Paragraph("Additional behavioral telemetry (digest)", h1))
+
+    story.append(Paragraph("Threat signatures (full report)", h2))
+    story.extend(
+        _chunked_tables(
+            ["Threat / Name", "Category", "Description"],
+            [[r[0], r[1], r[2]] for r in digest.signature_rows],
+            [1.4 * inch, 1.0 * inch, 3.7 * inch],
+            body,
+            mono,
+        )
+    )
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(Paragraph("MITRE ATT&CK (full report)", h2))
+    story.extend(
+        _chunked_tables(
+            ["Tactic", "Technique", "ID", "Description"],
+            [[r[0], r[1], r[2], r[3]] for r in digest.mitre_rows],
+            [1.0 * inch, 1.0 * inch, 0.7 * inch, 3.4 * inch],
+            body,
+            mono,
+        )
+    )
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(Paragraph("Mutexes and services / scheduled tasks (full report)", h2))
+    story.extend(_chunked_tables(["Mutex"], [[r[0]] for r in digest.mutex_rows], [6.1 * inch], body, mono))
+    story.append(Spacer(1, 0.06 * inch))
+    story.extend(
+        _chunked_tables(
+            ["Name / item", "Path / command", "Kind"],
+            [[r[0], r[1], r[2]] for r in digest.service_task_rows],
+            [1.4 * inch, 4.0 * inch, 0.7 * inch],
+            body,
+            mono,
+        )
+    )
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(Paragraph("Execution timeline (full report)", h2))
+    story.extend(
+        _chunked_tables(
+            ["Time", "Type", "Detail"],
+            [[r[0], r[1], r[2]] for r in digest.timeline_rows],
+            [0.9 * inch, 0.9 * inch, 4.3 * inch],
+            body,
+            mono,
+        )
+    )
     story.append(PageBreak())
 
     # Network activity
@@ -268,7 +683,7 @@ def build_analysis_pdf(
             dns_rows.append([str(d.get("domain") or d.get("host") or d), str(d.get("ip") or d.get("resolved_ip") or ""), str(d.get("timestamp") or d.get("time") or "")])
         else:
             dns_rows.append([str(d), "", ""])
-    story.append(_data_table(["Domain Queried", "Resolved IP(s)", "Timestamp"], dns_rows, [2.5 * inch, 1.7 * inch, 1.9 * inch], body, mono))
+    story.extend(_chunked_tables(["Domain Queried", "Resolved IP(s)", "Timestamp"], dns_rows, [2.5 * inch, 1.7 * inch, 1.9 * inch], body, mono))
     story.append(Spacer(1, 0.08 * inch))
 
     story.append(Paragraph("HTTP Requests", h2))
@@ -288,7 +703,15 @@ def build_analysis_pdf(
             )
         else:
             http_rows.append(["", str(h), "", "", "", ""])
-    story.append(_data_table(["Method", "Full URL", "User-Agent", "Response", "Length", "Timestamp"], http_rows, [0.6 * inch, 2.0 * inch, 1.2 * inch, 0.7 * inch, 0.6 * inch, 1.0 * inch], body, mono))
+    story.extend(
+        _chunked_tables(
+            ["Method", "Full URL", "User-Agent", "Response", "Length", "Timestamp"],
+            http_rows,
+            [0.6 * inch, 2.0 * inch, 1.2 * inch, 0.7 * inch, 0.6 * inch, 1.0 * inch],
+            body,
+            mono,
+        )
+    )
     story.append(Spacer(1, 0.08 * inch))
 
     story.append(Paragraph("Raw Connections", h2))
@@ -301,8 +724,49 @@ def build_analysis_pdf(
             conn_rows.append([src, dst, str(c.get("protocol") or c.get("transport") or ""), str(c.get("bytes_sent") or c.get("sent") or ""), str(c.get("bytes_received") or c.get("received") or "")])
         else:
             conn_rows.append(["", str(c), "", "", ""])
-    story.append(_data_table(["Source IP:Port", "Destination IP:Port", "Protocol", "Bytes Sent", "Bytes Received"], conn_rows, [1.5 * inch, 1.7 * inch, 0.8 * inch, 1.0 * inch, 1.1 * inch], body, mono))
+    story.extend(
+        _chunked_tables(
+            ["Source IP:Port", "Destination IP:Port", "Protocol", "Bytes Sent", "Bytes Received"],
+            conn_rows,
+            [1.5 * inch, 1.7 * inch, 0.8 * inch, 1.0 * inch, 1.1 * inch],
+            body,
+            mono,
+        )
+    )
     story.append(Spacer(1, 0.08 * inch))
+
+    if digest.network_dns_rows or digest.network_http_rows or digest.network_ip_rows:
+        story.append(Paragraph("Network flows (full JSON report — behavior.network)", h2))
+        story.extend(
+            _chunked_tables(
+                ["Proto", "Domain / host", "IP", "Port", "Request / detail"],
+                [[r[0], r[1], r[2], r[3], r[4] if len(r) > 4 else ""] for r in digest.network_dns_rows],
+                [0.5 * inch, 1.6 * inch, 1.2 * inch, 0.5 * inch, 2.3 * inch],
+                body,
+                mono,
+            )
+        )
+        story.append(Spacer(1, 0.06 * inch))
+        story.extend(
+            _chunked_tables(
+                ["Proto", "URI / URL", "IP", "Port"],
+                [[r[0], r[1], r[2], r[3]] for r in digest.network_http_rows],
+                [0.5 * inch, 3.5 * inch, 1.2 * inch, 0.9 * inch],
+                body,
+                mono,
+            )
+        )
+        story.append(Spacer(1, 0.06 * inch))
+        story.extend(
+            _chunked_tables(
+                ["IP", "Port", "Proto", "Related domain"],
+                [[r[0], r[1], r[2], r[3] if len(r) > 3 else ""] for r in digest.network_ip_rows],
+                [1.3 * inch, 0.7 * inch, 0.8 * inch, 3.3 * inch],
+                body,
+                mono,
+            )
+        )
+        story.append(Spacer(1, 0.08 * inch))
 
     story.append(Paragraph("Compromised / Flagged Hosts", h2))
     host_rows: list[list[str]] = []
@@ -334,38 +798,27 @@ def build_analysis_pdf(
                     str(d.get("verdict") or d.get("type") or ""),
                 ]
             )
-        story.append(_data_table(["Name", "Drop Path", "Size", "MD5", "SHA256", "Verdict"], d_rows, [0.9 * inch, 1.5 * inch, 0.5 * inch, 1.0 * inch, 1.2 * inch, 0.8 * inch], body, mono))
-    else:
-        story.append(Paragraph("No activity observed — dropped-files endpoint returned empty payload.", body))
-    story.append(PageBreak())
-
-    # Execution screenshots
-    story.append(Paragraph("Execution Screenshots", h1))
-    if screenshots:
-        for i, shot in enumerate(screenshots, start=1):
-            if not isinstance(shot, dict):
-                continue
-            blob = shot.get("bytes")
-            if not isinstance(blob, (bytes, bytearray)):
-                continue
-            ts = shot.get("timestamp") or shot.get("time") or "timestamp not returned by API"
-            story.append(Paragraph(f"Screenshot #{i} — {_esc(ts)}", h2))
-            try:
-                img = Image(BytesIO(bytes(blob)))
-                img._restrictSize(6.1 * inch, 8.5 * inch)
-                story.append(img)
-            except (OSError, ValueError):
-                story.append(Paragraph("No activity observed — screenshot bytes could not be decoded.", body))
-            story.append(Paragraph("Caption: Screenshot captured by Hybrid Analysis sandbox execution timeline.", small))
-            story.append(Spacer(1, 0.1 * inch))
-    else:
-        story.append(
-            Paragraph(
-                "The Hybrid Analysis platform returned no screenshots for this execution. This may indicate the sample ran as a "
-                "background or headless process without spawning a visible GUI window during the analysis period.",
+        story.extend(
+            _chunked_tables(
+                ["Name", "Drop Path", "Size", "MD5", "SHA256", "Verdict"],
+                d_rows,
+                [0.9 * inch, 1.5 * inch, 0.5 * inch, 1.0 * inch, 1.2 * inch, 0.8 * inch],
                 body,
+                mono,
             )
         )
+    elif digest.dropped_file_rows:
+        story.extend(
+            _chunked_tables(
+                ["SHA256 / hash", "Path / name", "Type / size"],
+                [[r[0], r[1], r[2]] for r in digest.dropped_file_rows],
+                [1.3 * inch, 3.5 * inch, 1.3 * inch],
+                body,
+                mono,
+            )
+        )
+    else:
+        story.append(Paragraph("No dropped-file rows from dropped-files or dropped-files-v2 API.", body))
     story.append(PageBreak())
 
     # Threat classification
@@ -379,7 +832,8 @@ def build_analysis_pdf(
 
     # IOC section
     story.append(Paragraph("Indicators of Compromise", h1))
-    ioc = build_ioc_summary(summary, processes, dropped)
+    ioc = build_ioc_summary(summary, proc_list, dropped)
+    _ioc_merge_digest(ioc, digest)
     story.append(Paragraph("FILE HASHES", h2))
     story.append(_data_table(["MD5", "SHA1", "SHA256", "File Name"], [[str(summary.get("md5") or ""), str(summary.get("sha1") or ""), str(summary.get("sha256") or ""), str(summary.get("submit_name") or source_file.name)]], [1.4 * inch, 1.4 * inch, 2.2 * inch, 1.1 * inch], body, mono))
     story.append(Spacer(1, 0.06 * inch))
@@ -409,8 +863,24 @@ def build_analysis_pdf(
 
     # Appendix
     story.append(Paragraph("Appendix", h1))
+    story.append(Paragraph("Flattened summary keys (all scalar / compact JSON values returned by API)", h2))
+    story.extend(
+        _chunked_tables(
+            ["Key", "Value"],
+            [[k, v] for k, v in digest.classification_rows],
+            [2.2 * inch, 3.9 * inch],
+            body,
+            mono,
+        )
+    )
+    story.append(PageBreak())
+    story.append(Paragraph("Telemetry path index (summary + report branches)", h2))
+    for ln in digest.appendix_telemetry_lines[:900]:
+        story.append(Paragraph(_esc(ln), mono))
+    story.append(PageBreak())
     story.extend(_json_block("Analysis Environment", {"environment_description": summary.get("environment_description"), "environment_id": summary.get("environment_id")}, mono, body))
-    story.extend(_json_block("Summary JSON (excerpt)", summary, mono, body))
+    story.extend(_json_block("Summary JSON (full)", summary, mono, body, max_lines=12000))
+    story.extend(_json_block("Full report JSON (full)", outcome.full_report, mono, body, max_lines=12000))
     story.extend(_json_block("Memory Dump Notes", memory_dumps, mono, body))
     story.extend(_json_block("Hash Verification", {"md5": summary.get("md5"), "sha1": summary.get("sha1"), "sha256": summary.get("sha256")}, mono, body))
 
@@ -436,8 +906,12 @@ def build_ioc_summary(summary: dict[str, Any], processes: list[Any], dropped: li
             continue
         for key in ("registry_keys_set", "registry_keys_deleted"):
             if isinstance(p.get(key), list):
-                regkeys.extend(str(x) for x in p.get(key))
-        for key in ("created_files", "deleted_files"):
+                for x in p.get(key):
+                    if isinstance(x, dict):
+                        regkeys.append(str(x.get("key") or x.get("path") or x.get("name") or x))
+                    else:
+                        regkeys.append(str(x))
+        for key in ("created_files", "deleted_files", "modified_files"):
             if isinstance(p.get(key), list):
                 filepaths.extend(str(x) for x in p.get(key))
         if isinstance(p.get("mutants"), list):
@@ -470,18 +944,32 @@ def build_recommendation_text(summary: dict[str, Any], ioc: dict[str, list[str]]
     return "No activity observed — API verdict does not indicate malicious or suspicious behavior requiring containment."
 
 
-def _json_block(title: str, payload: Any, mono: ParagraphStyle, body: ParagraphStyle) -> list[Any]:
+def _json_block(
+    title: str,
+    payload: Any,
+    mono: ParagraphStyle,
+    body: ParagraphStyle,
+    *,
+    max_lines: int = 8000,
+) -> list[Any]:
     out: list[Any] = [Paragraph(_esc(title), body)]
     if payload in (None, [], {}):
-        out.append(Paragraph("No activity observed — endpoint returned empty payload.", body))
+        out.append(Paragraph("(Empty payload.)", body))
         out.append(Spacer(1, 0.06 * inch))
         return out
     try:
         blob = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         blob = str(payload)
-    for ln in blob.splitlines()[:140]:
+    lines = blob.splitlines()
+    cap = min(len(lines), max_lines)
+    for i, ln in enumerate(lines[:cap]):
+        if i > 0 and i % 95 == 0:
+            out.append(PageBreak())
+            out.append(Paragraph(_esc(f"{title} (continued)"), body))
         out.append(Paragraph(_esc(ln), mono))
+    if len(lines) > cap:
+        out.append(Paragraph(_esc(f"… truncated after {cap} lines ({len(lines)} total)."), body))
     out.append(Spacer(1, 0.06 * inch))
     return out
 
@@ -501,7 +989,7 @@ def _process_tree_lines(by_pid: dict[str, dict[str, Any]], children: dict[str, l
 
     for root in roots[:80]:
         walk(root, 0)
-    return out or ["No activity observed — no process hierarchy returned by API."]
+    return out or ["(No parent/child process hierarchy in merged API data.)"]
 
 
 def _draw_page_frame(canvas: Any, doc: _HADocTemplate) -> None:
@@ -514,11 +1002,71 @@ def _draw_page_frame(canvas: Any, doc: _HADocTemplate) -> None:
     canvas.restoreState()
 
 
+def _chunked_tables(
+    headers: list[str],
+    rows: list[list[str]],
+    widths: list[float],
+    body: ParagraphStyle,
+    mono: ParagraphStyle,
+    *,
+    chunk_size: int = 90,
+) -> list[Any]:
+    blocks: list[Any] = []
+    if not rows:
+        return [_data_table(headers, rows, widths, body, mono)]
+    total = len(rows)
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        blocks.append(_data_table(headers, rows[start:end], widths, body, mono))
+        if end < total:
+            blocks.append(Spacer(1, 0.04 * inch))
+            blocks.append(Paragraph(_esc(f"(continued: rows {start + 1}–{end} of {total})"), body))
+    return blocks
+
+
+def _ioc_merge_digest(ioc: dict[str, list[str]], digest: Any) -> None:
+    for row in getattr(digest, "network_dns_rows", []) or []:
+        if len(row) > 1 and row[1]:
+            ioc.setdefault("domains", []).append(str(row[1]))
+        if len(row) > 2 and row[2]:
+            ip = str(row[2])
+            if _looks_like_ip(ip):
+                ioc.setdefault("ips", []).append(ip)
+    for row in getattr(digest, "network_http_rows", []) or []:
+        if len(row) > 1 and row[1]:
+            ioc.setdefault("urls", []).append(str(row[1]))
+        if len(row) > 2 and row[2] and _looks_like_ip(str(row[2])):
+            ioc.setdefault("ips", []).append(str(row[2]))
+    for row in getattr(digest, "network_ip_rows", []) or []:
+        if row and row[0]:
+            ioc.setdefault("ips", []).append(str(row[0]))
+    for row in getattr(digest, "mutex_rows", []) or []:
+        if row and row[0]:
+            ioc.setdefault("mutexes", []).append(str(row[0]))
+    for row in getattr(digest, "registry_rows", []) or []:
+        if len(row) > 1 and row[1]:
+            ioc.setdefault("regkeys", []).append(str(row[1]))
+    for row in getattr(digest, "file_activity_rows", []) or []:
+        if len(row) > 1 and row[1]:
+            ioc.setdefault("filepaths", []).append(str(row[1]))
+    for key in ("ips", "domains", "urls", "mutexes", "regkeys", "filepaths", "hashes"):
+        if key in ioc and isinstance(ioc[key], list):
+            ioc[key] = sorted(set(ioc[key]))
+
+
+def _looks_like_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s.strip().split("%", 1)[0])
+        return True
+    except ValueError:
+        return False
+
+
 def _data_table(headers: list[str], rows: list[list[str]], widths: list[float], body: ParagraphStyle, mono: ParagraphStyle) -> Table:
     if not rows:
-        rows = [["No activity observed — endpoint returned empty payload."] + [""] * (len(headers) - 1)]
+        rows = [["(none)"] + [""] * (len(headers) - 1)]
     data = [[Paragraph(f"<b>{_esc(h)}</b>", body) for h in headers]]
-    data.extend([[Paragraph(_esc(c), mono) for c in r] for r in rows[:300]])
+    data.extend([[Paragraph(_esc(c), mono) for c in r] for r in rows])
     t = Table(data, colWidths=widths, repeatRows=1)
     t.setStyle(
         TableStyle(
@@ -535,7 +1083,7 @@ def _data_table(headers: list[str], rows: list[list[str]], widths: list[float], 
 
 
 def _kv_table(rows: list[list[Any]], body: ParagraphStyle, mono: ParagraphStyle) -> Table:
-    data = [[Paragraph(_esc(str(k)), body), Paragraph(_esc(str(v) if v is not None else "No activity observed — field not returned by API"), mono)] for k, v in rows]
+    data = [[Paragraph(_esc(str(k)), body), Paragraph(_esc(str(v) if v is not None else "—"), mono)] for k, v in rows]
     t = Table(data, colWidths=[2.1 * inch, 4.0 * inch])
     t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.2, colors.HexColor("#90a4ae")), ("VALIGN", (0, 0), (-1, -1), "TOP")]))
     return t
@@ -550,6 +1098,42 @@ def _verdict_color(verdict: str) -> str:
     if v in ("clean", "no specific threat"):
         return "#2e7d32"
     return "#616161"
+
+
+def _extract_classification_signals(summary: dict[str, Any], full_report: dict[str, Any] | list[Any]) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    rows.append(("Verdict", str(summary.get("verdict") or "No activity observed — field not returned by API")))
+    rows.append(("Threat Score", str(summary.get("threat_score") or "No activity observed — field not returned by API")))
+    rows.append(("Family", str(summary.get("vx_family") or "No activity observed — field not returned by API")))
+    tags = summary.get("classification_tags") if isinstance(summary.get("classification_tags"), list) else []
+    if tags:
+        rows.append(("Classification Tags", ", ".join(str(x) for x in tags[:30])))
+    else:
+        rows.append(("Classification Tags", "No activity observed — API returned empty tags"))
+    text_blob_parts: list[str] = []
+    for source in (
+        summary.get("vx_family"),
+        summary.get("verdict"),
+        summary.get("threat_level"),
+        ", ".join(str(x) for x in tags),
+    ):
+        if source:
+            text_blob_parts.append(str(source))
+    if isinstance(full_report, dict):
+        sigs = full_report.get("signatures")
+        if isinstance(sigs, list):
+            for s in sigs[:80]:
+                if isinstance(s, dict):
+                    text_blob_parts.append(str(s.get("name") or s.get("threat") or s.get("description") or ""))
+                else:
+                    text_blob_parts.append(str(s))
+    blob = " ".join(text_blob_parts).lower()
+    families = []
+    for key in ("ransom", "trojan", "worm", "backdoor", "stealer", "dropper", "loader", "botnet", "spyware", "keylogger"):
+        if key in blob:
+            families.append(key)
+    rows.append(("Detected Classification Keywords", ", ".join(sorted(set(families))) if families else "No activity observed — none present in API text fields"))
+    return rows
 
 
 def _esc(text: str) -> str:

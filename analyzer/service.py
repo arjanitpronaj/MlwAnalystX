@@ -5,7 +5,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from urllib.parse import urlparse
 from typing import Any
 import ipaddress
 
@@ -15,6 +14,7 @@ from core.lifecycle import LifecyclePhase, LifecycleSnapshot, map_api_state_to_p
 from utils.hashes import file_hashes
 
 from .behavior_extract import BehavioralProfile, extract_from_ha_report
+from .ha_screenshots import extract_screenshot_images, merge_screenshot_json_payloads
 from .risk_engine import RiskLevel, score_risk
 
 LogFn = Callable[[str], None]
@@ -198,23 +198,34 @@ class AnalysisService:
 
         supplemental: dict[str, Any] = {}
         report_sha256 = str(summary.get("sha256") or sub.sha256 or "").strip().lower()
+        job_summary = dict(summary)
         if report_sha256:
             try:
                 summary_by_sha = client.get_report_summary_by_sha256(report_sha256)
-                if summary_by_sha:
-                    summary = summary_by_sha
                 supplemental["summary_by_sha"] = summary_by_sha
+                if isinstance(summary_by_sha, dict):
+                    merged = dict(summary_by_sha)
+                    merged.update(job_summary)
+                    summary = merged
             except HybridAnalysisError as exc:
                 log(f"⚠ SHA summary unavailable, using job summary: {exc}")
                 supplemental["summary_by_sha"] = summary
 
+            def _json_meaningful(x: Any) -> bool:
+                if x is None:
+                    return False
+                if isinstance(x, (list, dict)):
+                    return len(x) > 0
+                return True
+
             def safe_json(label: str, sha_path_call: Callable[[], Any | None], job_path: str) -> Any | None:
+                data: Any = None
                 try:
                     data = sha_path_call()
-                    if data is not None:
-                        return data
                 except HybridAnalysisError as exc:
                     log(f"⚠ {label} via SHA unavailable: {exc}; trying job endpoint fallback.")
+                if _json_meaningful(data):
+                    return data
                 return client.get_json_optional(job_path)
 
             def safe_bin(label: str, sha_bin_call: Callable[[], bytes | None], job_path: str) -> bytes | None:
@@ -228,65 +239,37 @@ class AnalysisService:
 
             supplemental["processes"] = safe_json("processes", lambda: client.get_report_processes(report_sha256), f"/report/{job_id}/processes")
             supplemental["dropped_files"] = safe_json("dropped-files", lambda: client.get_report_dropped_files(report_sha256), f"/report/{job_id}/dropped-files")
-            supplemental["screenshots"] = safe_json("screenshots", lambda: client.get_report_screenshots(report_sha256), f"/report/{job_id}/screenshots")
+            supplemental["dropped_files_v2"] = safe_json(
+                "dropped-files-v2",
+                lambda: client.get_json_optional(f"/report/{report_sha256}/dropped-files-v2"),
+                f"/report/{job_id}/dropped-files-v2",
+            )
+            sha_sh: Any = None
+            try:
+                sha_sh = client.get_report_screenshots(report_sha256)
+            except HybridAnalysisError as exc:
+                log(f"⚠ screenshots via SHA: {exc}")
+            job_sh = client.get_json_optional(f"/report/{job_id}/screenshots")
+            merged_sh = merge_screenshot_json_payloads(sha_sh, job_sh)
+            # Some summary payloads include screenshot metadata (same VM desktop gallery as the web UI).
+            sum_sh = summary.get("screenshots")
+            if sum_sh is not None:
+                merged_sh = merge_screenshot_json_payloads(merged_sh, sum_sh)
+            supplemental["screenshots"] = merged_sh
             supplemental["memory_dumps"] = safe_json("memory-dumps", lambda: client.get_report_memory_dumps(report_sha256), f"/report/{job_id}/memory-dumps")
             supplemental["strings"] = safe_json("strings", lambda: client.get_report_strings(report_sha256), f"/report/{job_id}/strings")
             supplemental["pcap"] = safe_bin("pcap", lambda: client.get_report_pcap(report_sha256), f"/report/{job_id}/pcap")
 
-            screenshots = supplemental.get("screenshots")
-            screenshot_images: list[dict[str, Any]] = []
-            screenshot_items: list[Any] = []
-            if isinstance(screenshots, list):
-                screenshot_items = screenshots
-            elif isinstance(screenshots, dict):
-                nested = screenshots.get("screenshots") or screenshots.get("items") or screenshots.get("data")
-                if isinstance(nested, list):
-                    screenshot_items = nested
-            if isinstance(screenshot_items, list):
-                for idx, item in enumerate(screenshot_items, start=1):
-                    if not isinstance(item, dict):
-                        continue
-                    refs: list[str] = []
-                    ref = (
-                        item.get("screenshot")
-                        or item.get("path")
-                        or item.get("url")
-                        or item.get("reference")
-                    )
-                    if isinstance(ref, str) and ref.strip():
-                        parsed = urlparse(ref)
-                        candidate_path = parsed.path if parsed.scheme and parsed.netloc else ref
-                        if candidate_path.startswith("/"):
-                            refs.append(candidate_path)
-                        else:
-                            refs.append(f"/report/{job_id}/screenshots/{candidate_path.lstrip('/')}")
-                    token = item.get("id") or item.get("name") or item.get("slot") or item.get("index")
-                    if token is not None:
-                        tok = str(token).strip()
-                        if tok:
-                            refs.append(f"/report/{job_id}/screenshots/{tok}")
-                            refs.append(f"/report/{job_id}/screenshot/{tok}")
-                    refs.append(f"/report/{report_sha256}/screenshots/{idx}")
-                    refs.append(f"/report/{report_sha256}/screenshots/{idx - 1}")
-                    refs.append(f"/report/{report_sha256}/screenshot/{idx}")
-
-                    blob: bytes | None = None
-                    seen_paths: set[str] = set()
-                    for candidate_path in refs:
-                        if candidate_path in seen_paths:
-                            continue
-                        seen_paths.add(candidate_path)
-                        blob = client.get_binary_optional(candidate_path, max_bytes=self._settings.max_screenshot_bytes)
-                        if blob:
-                            break
-
-                    if blob:
-                        screenshot_images.append(
-                            {
-                                "name": str(item.get("name") or item.get("id") or f"screenshot_{idx}"),
-                                "bytes": blob,
-                            }
-                        )
+            screenshot_images = extract_screenshot_images(
+                supplemental.get("screenshots"),
+                get_binary=lambda path, mb: client.get_binary_optional(path, max_bytes=mb),
+                job_id=job_id,
+                report_sha256=report_sha256,
+                environment_id=summary.get("environment_id"),
+                max_bytes=self._settings.max_screenshot_bytes,
+                max_images=max(self._settings.max_embedded_screenshots, 36),
+                log=log,
+            )
             if screenshot_images:
                 supplemental["screenshot_images"] = screenshot_images
             supplemental["pcap_summary"] = self._summarize_pcap_and_network(supplemental.get("pcap"), summary)
